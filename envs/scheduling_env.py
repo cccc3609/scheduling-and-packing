@@ -67,7 +67,7 @@ class SchedulingEnv(gym.Env):
 
                 # A. 价值 = 面积
                 area = sum([p['area'] for p in parts])
-                self.orders_snapshot[oid]['total_area'] = area / self.plate_area
+                self.orders_snapshot[oid]['total_area'] = area
 
                 # B. 物理工时 = 周长 / 速度
                 perimeter = sum([2 * (p['w'] + p['h']) for p in parts])

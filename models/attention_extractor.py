@@ -41,6 +41,9 @@ class AttentionFeatureExtractor(BaseFeaturesExtractor):
         self.final_fc = nn.Linear(concat_dim, features_dim)
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        if torch.isnan(observations).any() or torch.isinf(observations).any():
+            observations = torch.nan_to_num(observations, nan=0.0, posinf=5.0, neginf=-5.0)
+
         batch_size = observations.shape[0]
 
         global_feat = None
@@ -66,5 +69,12 @@ class AttentionFeatureExtractor(BaseFeaturesExtractor):
             final_input = torch.cat([global_feat, seq_context], dim=1)
         else:
             final_input = seq_context
+
+            # 🟢 新增：出口清洗
+            # 防止 Global Pooling 因为除以极小值产生过大的特征
+            final_output = self.final_fc(final_input)
+
+            # 限制特征层的输出范围，防止传给 PPO 的 Logits 爆炸
+            final_output = torch.clamp(final_output, -10.0, 10.0)
 
         return self.final_fc(final_input)
