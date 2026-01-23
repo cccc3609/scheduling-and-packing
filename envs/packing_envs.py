@@ -1,6 +1,7 @@
 import gymnasium as gym
 import numpy as np
 import copy
+import math
 from gymnasium import spaces
 
 from heuristic.blf_skyline_maxrects import PlateLayoutManager
@@ -14,16 +15,15 @@ class NestingSchedulingEnv(gym.Env):
 
         self.max_capacity = MAX_PARTS_CAPACITY
         self.max_sched_capacity = MAX_SCHED_TASKS_CAPACITY
-        # 默认值，reset时会被覆盖
         self.current_num_parts = TRAIN_CONFIG['min_parts']
 
-        # === 1. 读取经济与物理参数 ===
+        # === 1. 物理参数 ===
         self.CUTTING_SPEED = COST_CONFIG['cutting_speed']
         self.COST_MAT = COST_CONFIG['cost_material']
         self.COST_HOLD = COST_CONFIG['cost_earliness']
         self.COST_TARD = COST_CONFIG['cost_tardiness']
 
-        # 物理尺寸 (Reset时可变)
+        # 物理尺寸 (默认值)
         self.fixed_w, self.fixed_h = plate_size
         self.plate_w = 200
         self.plate_h = 200
@@ -31,20 +31,20 @@ class NestingSchedulingEnv(gym.Env):
         # 动态归一化因子
         self.episode_time_scale = 100.0
 
-        # === 2. 辅助引导权重 ===
+        # === 2. 权重配置 ===
+        self.w_util = 5.0
+        self.w_jit = 2.0
         self.w_grouping = 0.5
         self.w_step_compact = 0.5
         self.w_new_plate = 5.0
 
-        self.ALPHA = 1.0
-        self.BETA = 4.0
-
         # === 3. 空间定义 ===
+        # 22维特征
         self.obs_feature_dim = 22
         self.num_strategies = 3
 
         self.action_space = spaces.Discrete(self.max_capacity * 2 * self.num_strategies)
-
+        # 1D Flattened Observation
         self.observation_space = spaces.Box(
             low=-float('inf'), high=float('inf'),
             shape=(self.max_capacity * self.obs_feature_dim,), dtype=np.float32
@@ -57,11 +57,10 @@ class NestingSchedulingEnv(gym.Env):
         self.packed_indices = set()
         self.active_plates = []
         self.history_plates = []
-
         self.cost_metrics = {}
-        self.last_norm_util = 0.0;
-        self.last_norm_jit = 0.0;
-        self.last_raw_jit = 0.0
+
+        self.last_norm_util = 0.0
+        self.last_norm_jit = 0.0
 
     def set_scheduling_partner(self, model):
         self.scheduler_model = model
@@ -69,7 +68,7 @@ class NestingSchedulingEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        # === 动态配置 ===
+        # 动态配置
         if options and 'num_parts' in options:
             self.current_num_parts = options['num_parts']
         else:
@@ -89,8 +88,9 @@ class NestingSchedulingEnv(gym.Env):
         # 生成数据
         self.parts_pool, self.orders = self._generate_random_orders()
 
-        # 计算本局时间标尺 (总物理工时)
+        # 计算本局时间标尺
         total_perimeter = sum([2 * (p['w'] + p['h']) for p in self.parts_pool])
+        # 强制最小值为10.0，防止除以0
         self.episode_time_scale = max(10.0, total_perimeter / self.CUTTING_SPEED)
 
         self.packed_indices = set()
@@ -108,7 +108,6 @@ class NestingSchedulingEnv(gym.Env):
         temp_action = action // self.num_strategies
         part_index = temp_action // 2
 
-        # 校验
         if part_index >= self.current_num_parts or part_index in self.packed_indices:
             return self._get_obs(), -100.0, True, False, {}
 
@@ -117,7 +116,7 @@ class NestingSchedulingEnv(gym.Env):
 
         reward = 0.0
 
-        # === 智能 Best Fit 搜索 ===
+        # === Best Fit ===
         best_plate_idx = -1
         best_plate_score = -float('inf')
         part_due = part['due_date']
@@ -142,7 +141,6 @@ class NestingSchedulingEnv(gym.Env):
                     best_plate_score = final_score
                     best_plate_idx = idx
 
-        # === 执行放置 ===
         if best_plate_idx != -1:
             target = self.active_plates[best_plate_idx]
             s, x, y, w, h, _ = target.place_part(part['w'], part['h'], part['order_id'], strategy_id)
@@ -151,7 +149,7 @@ class NestingSchedulingEnv(gym.Env):
 
             reward += 0.05
 
-            # 密集度引导
+            # 密集度
             cx_sum, cy_sum, count = 0, 0, 0
             for p in target.placed_parts:
                 cx_sum += p[0] + p[2] / 2
@@ -162,22 +160,19 @@ class NestingSchedulingEnv(gym.Env):
             max_dist = (self.plate_w ** 2 + self.plate_h ** 2) ** 0.5
 
             if count > 1:
-                centroid_x, centroid_y = cx_sum / count, cy_sum / count
-                dist = ((current_cx - centroid_x) ** 2 + (current_cy - centroid_y) ** 2) ** 0.5
+                dist = ((current_cx - cx_sum / count) ** 2 + (current_cy - cy_sum / count) ** 2) ** 0.5
                 reward += (1.0 - dist / max_dist) * self.w_step_compact
             else:
                 dist_origin = (current_cx ** 2 + current_cy ** 2) ** 0.5
                 reward += (1.0 - dist_origin / max_dist) * self.w_step_compact
         else:
-            # 开新板
             new_plate = PlateLayoutManager(width=self.plate_w, height=self.plate_h)
             s, x, y, w, h, _ = new_plate.place_part(part['w'], part['h'], part['order_id'], strategy_id)
-
             if s:
                 self.active_plates.append(new_plate)
-                reward -= 1.0
+                reward -= self.w_new_plate
             else:
-                reward -= 50.0  # 异常
+                reward -= 50.0
 
         terminated = len(self.packed_indices) == self.current_num_parts
         info = {}
@@ -185,8 +180,6 @@ class NestingSchedulingEnv(gym.Env):
         if terminated:
             self.history_plates = self.active_plates
             final_plates = [p for p in self.history_plates if len(p.placed_parts) > 0]
-
-            # === 💰 成本结算 ===
 
             # 1. 材料成本
             consumed_area = len(final_plates) * (self.plate_w * self.plate_h)
@@ -201,18 +194,18 @@ class NestingSchedulingEnv(gym.Env):
             for oid, finish_time in order_finishes.items():
                 due = self.orders[oid]['due_date']
 
-                # 计算订单价值 (面积)
+                # 订单价值
                 order_parts = [p for p in self.parts_pool if p['order_id'] == oid]
                 order_value = sum([p['area'] for p in order_parts])
 
-                # 计算订单工时 (用于梯形窗口)
+                # 订单工时
                 order_perim = sum([2 * (p['w'] + p['h']) for p in order_parts])
                 order_proc_time = max(1.0, order_perim / self.CUTTING_SPEED)
 
                 diff = finish_time - due
                 abs_diff = abs(diff)
 
-                # 梯形窗口系数
+                # 梯形窗口
                 ratio = abs_diff / order_proc_time
                 R_FREE, R_FULL = 0.025, 0.075
                 if ratio <= R_FREE:
@@ -222,15 +215,14 @@ class NestingSchedulingEnv(gym.Env):
                 else:
                     coef = 1.0
 
-                rate = self.COST_TARD if diff > 0 else self.COST_HOLD
-
-                # 归一化价值权重 (订单面积 / 单板面积)
+                # 归一化价值权重
                 val_weight = order_value / (self.plate_w * self.plate_h)
 
-                # Cost = 价值权重 * 费率 * 惩罚系数 * 绝对时间
-                cost_jit += val_weight * (rate * coef) * abs_diff
-
-                if diff > 0: total_delay += diff
+                if diff > 0:
+                    cost_jit += val_weight * (self.COST_TARD * coef) * abs_diff
+                    total_delay += diff
+                else:
+                    cost_jit += val_weight * (self.COST_HOLD * coef) * abs_diff
 
             total_cost = cost_material + cost_jit
 
@@ -239,7 +231,12 @@ class NestingSchedulingEnv(gym.Env):
             baseline_cost = total_part_area * self.COST_MAT
             if baseline_cost <= 0: baseline_cost = 1.0
 
+            # 目标：最小化 Total / Baseline
             scaled_reward = - (total_cost / baseline_cost) * 10.0
+
+            # 🟢 强力截断：防止梯度爆炸
+            scaled_reward = np.clip(scaled_reward, -50.0, 50.0)
+
             reward += scaled_reward
 
             self.cost_metrics = {
@@ -257,6 +254,7 @@ class NestingSchedulingEnv(gym.Env):
         return self._get_obs(), reward, terminated, False, info
 
     def _simulate_batch_scheduling_detailed(self, plates_list):
+        """全量仿真：确保与 SchedulingEnv 维度一致"""
         temp_sched = SchedulerStateMachine(num_machines=3)
         tasks = []
         for idx, plate in enumerate(plates_list):
@@ -272,18 +270,24 @@ class NestingSchedulingEnv(gym.Env):
             best_task_idx, best_mach_idx = -1, -1
 
             if self.scheduler_model:
+                # 🟢 使用配置的 MAX_SCHED_TASKS_CAPACITY
                 MAX_SIM = self.max_sched_capacity
-                m_feat = (mach_times - min_t) / self.episode_time_scale
+
+                # 构造 Observation (必须与 SchedulingEnv 一致)
+                safe_scale = max(1.0, self.episode_time_scale)
+                m_feat = (mach_times - min_t) / safe_scale
                 t_feat = []
                 mask = np.zeros(MAX_SIM * 3, dtype=bool)
                 has_v = False
+
                 for i in range(MAX_SIM):
                     if i < len(tasks):
                         t = tasks[i]
+                        # NormVal
                         norm_val = t['val'] / 140000.0
                         t_feat.extend([
-                            t['cut'] / self.episode_time_scale,
-                            (t['due'] - min_t) / self.episode_time_scale,
+                            t['cut'] / safe_scale,
+                            (t['due'] - min_t) / safe_scale,
                             1.0 if t['done'] else 0.0,
                             norm_val
                         ])
@@ -294,6 +298,7 @@ class NestingSchedulingEnv(gym.Env):
                 if not has_v: mask = np.ones(MAX_SIM * 3, dtype=bool)
 
                 obs = np.concatenate([m_feat, t_feat]).astype(np.float32)
+                # 🟢 强力数值清洗
                 obs = np.nan_to_num(obs, nan=0.0, posinf=5.0, neginf=-5.0)
                 obs = np.clip(obs, -5.0, 5.0)
 
@@ -301,21 +306,16 @@ class NestingSchedulingEnv(gym.Env):
                 best_task_idx = int(action) // 3
                 best_mach_idx = int(action) % 3
             else:
-                # 启发式：基于成本
+                # EDD 启发式
                 min_cost = float('inf')
                 for i, t in enumerate(tasks):
                     if t['done']: continue
                     for m in range(3):
                         end = mach_times[m] + t['cut']
                         diff = end - t['due']
-
-                        # 订单价值权重 (归一化到板材)
-                        plate_val_weight = t['val'] / (self.plate_w * self.plate_h)
-
-                        c = plate_val_weight * self.COST_TARD * diff if diff > 0 else plate_val_weight * self.COST_HOLD * abs(
-                            diff)
-                        c += (mach_times[m] - min_t) * 0.1
-                        if c < min_cost: min_cost, best_task_idx, best_mach_idx = c, i, m
+                        cost = self.COST_TARD * diff if diff > 0 else self.COST_HOLD * abs(diff)
+                        cost += (mach_times[m] - min_t) * 0.1
+                        if cost < min_cost: min_cost, best_task_idx, best_mach_idx = cost, i, m
 
             if best_task_idx != -1:
                 task = tasks[best_task_idx]
@@ -461,6 +461,11 @@ class NestingSchedulingEnv(gym.Env):
             na = p['area'] / (self.plate_w * self.plate_h)
             rd = (p['due_date'] - curr_time) / self.episode_time_scale
             obs[i] = [nw, nh, na, rd, pk] + g_feats
+
+        obs = np.nan_to_num(obs, nan=0.0, posinf=5.0, neginf=-5.0)
+        obs = np.clip(obs, -5.0, 5.0)
+
+
         return obs.flatten()
 
     def _get_action_mask(self):

@@ -9,6 +9,7 @@ from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
 
+# 引入项目模块
 from envs.packing_envs import NestingSchedulingEnv
 from envs.scheduling_env import SchedulingEnv
 from custom_callbacks import TensorboardCallback, SnapshotCallback
@@ -20,6 +21,7 @@ def mask_fn(env):
     return env.get_wrapper_attr("_get_action_mask")()
 
 
+# 学习率调度器
 def exponential_schedule(start_lr: float, end_lr: float = 1e-5) -> Callable[[float], float]:
     def func(progress_remaining: float) -> float:
         current_progress = 1.0 - progress_remaining
@@ -32,18 +34,50 @@ def setup_experiment():
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     exp_name = f"exp_{timestamp}"
     base_dir = f"./experiments/{exp_name}"
-    log_n, log_s = f"{base_dir}/logs/nesting/", f"{base_dir}/logs/scheduling/"
-    save_dir, code_dir = f"{base_dir}/models/", f"{base_dir}/code_backup/"
-    for d in [log_n, log_s, save_dir, code_dir]: os.makedirs(d, exist_ok=True)
+    log_n = f"{base_dir}/logs/nesting/"
+    log_s = f"{base_dir}/logs/scheduling/"
+    save_dir = f"{base_dir}/models/"
+    code_dir = f"{base_dir}/code_backup/"
 
-    files_to_backup = ["train_dual.py", "custom_callbacks.py", "config.py", "evaluate_generalization.py",
-                       "visualize_results.py"]
+    # 创建目录
+    for d in [log_n, log_s, save_dir, code_dir]:
+        os.makedirs(d, exist_ok=True)
+
+    # 🟢 备份根目录脚本 (增加 evaluate_batch.py, test_result.py 等)
+    files_to_backup = [
+        "train_dual.py",
+        "custom_callbacks.py",
+        "config.py",
+        "evaluate_generalization.py",
+        "visualize_results.py",
+        "evaluate_batch.py",
+        "test_result.py"  # 如果有的话
+    ]
+
     for f in files_to_backup:
-        if os.path.exists(f): shutil.copy(f, code_dir)
-    for folder in ["envs", "heuristic", "models"]:
-        if os.path.exists(folder):
-            shutil.copytree(folder, f"{code_dir}/{folder}", dirs_exist_ok=True,
-                            ignore=shutil.ignore_patterns("__pycache__"))
+        if os.path.exists(f):
+            shutil.copy(f, code_dir)
+            print(f"Backed up file: {f}")
+
+    # 🟢 备份文件夹 (envs, heuristic, models)
+    folders_to_backup = ["envs", "heuristic", "models"]
+    for folder in folders_to_backup:
+        src = folder
+        dst = os.path.join(code_dir, folder)
+        if os.path.exists(src):
+            # 如果目标目录存在，先删除（虽然这里是新建的实验目录，通常不存在，但为了健壮性）
+            if os.path.exists(dst):
+                shutil.rmtree(dst)
+
+            shutil.copytree(
+                src,
+                dst,
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc")
+            )
+            print(f"Backed up folder: {src}")
+
+    print(f"📦 Experiment initialized: {base_dir}")
     return log_n, log_s, save_dir
 
 
