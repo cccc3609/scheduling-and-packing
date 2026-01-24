@@ -33,7 +33,7 @@ class NestingSchedulingEnv(gym.Env):
 
         # === 2. 权重配置 ===
         self.w_util = 5.0
-        self.w_jit = 2.0
+        self.w_jit = 4.0
         self.w_grouping = 0.5
         self.w_step_compact = 0.5
         self.w_new_plate = 5.0
@@ -101,70 +101,78 @@ class NestingSchedulingEnv(gym.Env):
 
         return self._get_obs(), {"action_mask": self._get_action_mask()}
 
+    def _evaluate_placement_quality(self, plate, part_w, part_h, part_due, part_area,
+                                    x, y, w, h, current_util):
+        # 1. 几何
+        geo_score = current_util * 10.0
+        touching = 0
+        if x == 0: touching += 1
+        if y == 0: touching += 1
+        if x + w == self.plate_w: touching += 1
+        if y + h == self.plate_h: touching += 1
+        geo_score += touching * 0.2
+
+        # 2. 时间
+        time_penalty = 0.0
+        existing_parts = plate.placed_parts
+        if existing_parts:
+            oids = list(set([int(p[4]) for p in existing_parts]))
+            dues = [self.orders[oid]['due_date'] for oid in oids if oid in self.orders]
+            if dues:
+                min_d, max_d = min(dues), max(dues)
+                if part_due < min_d:
+                    drop = (min_d - part_due) / self.episode_time_scale
+                    time_penalty += drop * 15.0
+                new_min = min(min_d, part_due)
+                new_max = max(max_d, part_due)
+                expansion = (new_max - new_min) - (max_d - min_d)
+                time_penalty += (expansion / self.episode_time_scale) * 2.0
+
+        return (self.w_util * geo_score) - (self.w_jit * time_penalty)
+
     def step(self, action):
         if isinstance(action, np.ndarray): action = int(action)
-
         strategy_id = action % self.num_strategies
-        temp_action = action // self.num_strategies
-        part_index = temp_action // 2
+        part_index = (action // self.num_strategies) // 2
 
         if part_index >= self.current_num_parts or part_index in self.packed_indices:
             return self._get_obs(), -100.0, True, False, {}
 
         part = self.parts_pool[part_index]
         self.packed_indices.add(part_index)
-
         reward = 0.0
 
-        # === Best Fit ===
-        best_plate_idx = -1
-        best_plate_score = -float('inf')
-        part_due = part['due_date']
-        is_small_part = (part['area'] / (self.plate_w * self.plate_h)) < 0.05
-
+        best_idx, best_score = -1, -float('inf')
         for idx, plate in enumerate(self.active_plates):
             sim_plate = copy.deepcopy(plate)
-            success, _, _, _, _, _ = sim_plate.place_part(part['w'], part['h'], part['order_id'], strategy_id)
+            ok, sx, sy, sw, sh, _ = sim_plate.place_part(part['w'], part['h'], part['order_id'], strategy_id)
+            if ok:
+                score = self._evaluate_placement_quality(
+                    plate, part['w'], part['h'], part['due_date'], part['area'],
+                    sx, sy, sw, sh, sim_plate.utilization
+                )
+                if score > best_score: best_score, best_idx = score, idx
 
-            if success:
-                geo_score = sim_plate.utilization
-                time_penalty = 0.0
-                if not is_small_part:
-                    existing_oids = list(set([int(p[4]) for p in plate.placed_parts]))
-                    if existing_oids:
-                        avg_due = np.mean([self.orders[oid]['due_date'] for oid in existing_oids])
-                        # 归一化时间差
-                        time_penalty = abs(part_due - avg_due) / self.episode_time_scale
-
-                final_score = geo_score - (self.w_grouping * time_penalty)
-                if final_score > best_plate_score:
-                    best_plate_score = final_score
-                    best_plate_idx = idx
-
-        if best_plate_idx != -1:
-            target = self.active_plates[best_plate_idx]
+        if best_idx != -1:
+            target = self.active_plates[best_idx]
             s, x, y, w, h, _ = target.place_part(part['w'], part['h'], part['order_id'], strategy_id)
-            if not s:
-                s, x, y, w, h, _ = target.place_part(part['w'], part['h'], part['order_id'], 2)
+            if not s: s, x, y, w, h, _ = target.place_part(part['w'], part['h'], part['order_id'], 2)
+            reward += 0.1
 
-            reward += 0.05
-
-            # 密集度
+            # 紧凑度
             cx_sum, cy_sum, count = 0, 0, 0
             for p in target.placed_parts:
-                cx_sum += p[0] + p[2] / 2
-                cy_sum += p[1] + p[3] / 2
+                cx_sum += p[0] + p[2] / 2;
+                cy_sum += p[1] + p[3] / 2;
                 count += 1
-
-            current_cx, current_cy = x + w / 2, y + h / 2
-            max_dist = (self.plate_w ** 2 + self.plate_h ** 2) ** 0.5
-
+            curr_cx, curr_cy = x + w / 2, y + h / 2
+            max_d = (self.plate_w ** 2 + self.plate_h ** 2) ** 0.5
             if count > 1:
-                dist = ((current_cx - cx_sum / count) ** 2 + (current_cy - cy_sum / count) ** 2) ** 0.5
-                reward += (1.0 - dist / max_dist) * self.w_step_compact
+                d = ((curr_cx - cx_sum / count) ** 2 + (curr_cy - cy_sum / count) ** 2) ** 0.5
+                reward += (1.0 - d / max_d) * self.w_step_compact
             else:
-                dist_origin = (current_cx ** 2 + current_cy ** 2) ** 0.5
-                reward += (1.0 - dist_origin / max_dist) * self.w_step_compact
+                d = (curr_cx ** 2 + curr_cy ** 2) ** 0.5
+                reward += (1.0 - d / max_d) * self.w_step_compact
         else:
             new_plate = PlateLayoutManager(width=self.plate_w, height=self.plate_h)
             s, x, y, w, h, _ = new_plate.place_part(part['w'], part['h'], part['order_id'], strategy_id)

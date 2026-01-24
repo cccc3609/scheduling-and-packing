@@ -36,11 +36,11 @@ COST_CONFIG = {
 
     # [库存持有成本] (提前完工)
     # 占用仓库资金，假设为材料价值的万分之一/每分钟
-    "cost_earliness": 0.0001,
+    "cost_earliness": 0.0005,
 
     # [延期违约成本] (迟到)
     # 罚款通常是库存成本的 20~50 倍
-    "cost_tardiness": 0.005,
+    "cost_tardiness": 0.001,
 
     # 默认板材尺寸 (仅初始化用)
     "default_plate_size": (200, 200)

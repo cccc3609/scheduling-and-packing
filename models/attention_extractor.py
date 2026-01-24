@@ -41,6 +41,7 @@ class AttentionFeatureExtractor(BaseFeaturesExtractor):
         self.final_fc = nn.Linear(concat_dim, features_dim)
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        # 输入清洗保持不变
         if torch.isnan(observations).any() or torch.isinf(observations).any():
             observations = torch.nan_to_num(observations, nan=0.0, posinf=5.0, neginf=-5.0)
 
@@ -65,16 +66,19 @@ class AttentionFeatureExtractor(BaseFeaturesExtractor):
 
         seq_context = torch.sum(masked_embeddings, dim=1) / num_valid
 
+        # 合并逻辑
         if global_feat is not None:
             final_input = torch.cat([global_feat, seq_context], dim=1)
         else:
             final_input = seq_context
 
-            # 🟢 新增：出口清洗
-            # 防止 Global Pooling 因为除以极小值产生过大的特征
-            final_output = self.final_fc(final_input)
+        # 🟢 修正：统一在最后进行 FC 映射和 Clamp，并返回正确变量
+        final_output = self.final_fc(final_input)
 
-            # 限制特征层的输出范围，防止传给 PPO 的 Logits 爆炸
-            final_output = torch.clamp(final_output, -10.0, 10.0)
+        # 再次进行防爆清洗（防止梯度爆炸导致的 NaN）
+        if torch.isnan(final_output).any() or torch.isinf(final_output).any():
+            final_output = torch.nan_to_num(final_output, nan=0.0, posinf=10.0, neginf=-10.0)
 
-        return self.final_fc(final_input)
+        final_output = torch.clamp(final_output, -10.0, 10.0)
+
+        return final_output  # <--- 必须返回处理过的变量

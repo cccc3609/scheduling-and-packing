@@ -22,7 +22,7 @@ class SchedulingEnv(gym.Env):
 
         self.episode_time_scale = 100.0
         self.baseline_cost = 1.0
-        # 🟢 初始化默认值
+        # 初始化默认值
         self.plate_w = 200
         self.plate_h = 200
         self.plate_area = 40000.0
@@ -31,6 +31,8 @@ class SchedulingEnv(gym.Env):
         self.machine_times = np.zeros(num_machines)
         self.scheduled_mask = np.zeros(self.max_tasks, dtype=bool)
         self.orders_snapshot = {}
+        self.nesting_env = None
+        self.nesting_model = None
 
     def set_nesting_partner(self, env, model):
         self.nesting_env = env
@@ -49,7 +51,7 @@ class SchedulingEnv(gym.Env):
 
         if self.nesting_env:
             obs, _ = self.nesting_env.reset(seed=seed)
-            # 🟢 同步
+            # 同步
             self.episode_time_scale = max(10.0, float(self.nesting_env.unwrapped.episode_time_scale))
             real = self.nesting_env.unwrapped
             self.plate_w = real.plate_w
@@ -121,7 +123,7 @@ class SchedulingEnv(gym.Env):
                 t_feat.extend([0.0, 0.0, 1.0, 0.0])
 
         obs = np.concatenate([m_feat, t_feat]).astype(np.float32)
-        # 🟢 终极防爆
+        # 终极防爆
         obs = np.nan_to_num(obs, nan=0.0, posinf=5.0, neginf=-5.0)
         obs = np.clip(obs, -5.0, 5.0)
         return obs
@@ -135,7 +137,18 @@ class SchedulingEnv(gym.Env):
             return self._get_obs(), -10.0, True, False, {}
 
         task = self.task_pool[t_idx]
-        start = self.machine_times[m_idx]
+        curr_machine_time = self.machine_times[m_idx]
+
+        # === 🟢 [JIT 核心修改] Lazy Start 策略 ===
+        # 计算为了准时交货，最晚应该什么时候开始
+        # 如果任务截止期是100，工时10，那么最晚90开始
+        lazy_start = task['due'] - task['cut']
+
+        # 实际开始时间 = max(机器空闲时间, 最晚开始时间)
+        # 如果机器空闲时间(50) < 最晚开始时间(90)，机器会"休息"到90再开工
+        # 如果机器空闲时间(95) > 最晚开始时间(90)，机器只能立即开工(95)，此时会延期
+        start = max(curr_machine_time, lazy_start)
+
         end = start + task['cut']
         self.machine_times[m_idx] = end
         self.scheduled_mask[t_idx] = True
@@ -163,8 +176,8 @@ class SchedulingEnv(gym.Env):
                 diff = fin - due
                 ratio = abs(diff) / order_proc_time
 
-                # 梯形窗口
-                R_FREE = 0.025;
+                # 梯形窗口 (保持原逻辑)
+                R_FREE = 0.025
                 R_FULL = 0.075
                 if ratio <= R_FREE:
                     coef = 0.0
