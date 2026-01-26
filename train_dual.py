@@ -89,18 +89,17 @@ def main():
     sched_env = SchedulingEnv()
     sched_env = ActionMasker(sched_env, mask_fn)
 
-    # === 🟢 核心修改：使用 Tanh 激活函数防止数值爆炸 ===
     pk_nest = dict(
         features_extractor_class=AttentionFeatureExtractor,
         features_extractor_kwargs=dict(features_dim=256, item_dim=22, global_prefix_dim=0),
-        activation_fn=nn.Tanh,  # <--- 改这里
+        activation_fn=nn.Tanh,
         net_arch=dict(pi=[512, 512, 256], vf=[512, 512, 256])
     )
 
     pk_sched = dict(
         features_extractor_class=AttentionFeatureExtractor,
         features_extractor_kwargs=dict(features_dim=256, item_dim=4, global_prefix_dim=3),
-        activation_fn=nn.Tanh,  # <--- 改这里
+        activation_fn=nn.Tanh,
         net_arch=dict(pi=[256, 256], vf=[256, 256])
     )
 
