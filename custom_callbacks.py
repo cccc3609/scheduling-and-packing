@@ -6,16 +6,8 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 
 class TensorboardCallback(BaseCallback):
-    """
-    一个“全量记录型” TensorBoard Callback：
-    - 保留你已有的 Physical / Economy / Rewards
-    - 额外透传 SB3 / MaskablePPO 的全部训练指标
-    """
 
     def _on_step(self) -> bool:
-        # =====================================================
-        # A. 环境 episode 级指标（你原来就有的）
-        # =====================================================
         for info in self.locals.get("infos", []):
             if "episode_metrics" not in info:
                 continue
@@ -48,15 +40,9 @@ class TensorboardCallback(BaseCallback):
             elif 'norm_util_score' in m:
                 self.logger.record("Rewards/Norm_Util", m['norm_util_score'])
                 self.logger.record("Rewards/Norm_JIT", m['norm_jit_score'])
-
-        # =====================================================
-        # B. PPO / MaskablePPO 训练级指标（新增）
-        # =====================================================
         if self.model is not None and hasattr(self.model, "logger"):
-            # SB3 内部 logger 里已经有这些值
-            # 我们只负责“转存”
+            
             for key, value in self.model.logger.name_to_value.items():
-                # 只转存 train/ rollout/ 等训练相关指标
                 if key.startswith("train/") or key.startswith("rollout/"):
                     self.logger.record(key, value)
 
@@ -64,9 +50,6 @@ class TensorboardCallback(BaseCallback):
 
 
 class SnapshotCallback(BaseCallback):
-    """
-    你原来的快照回调，原样保留
-    """
     def __init__(self, freq, log_dir):
         super().__init__()
         self.freq = freq
