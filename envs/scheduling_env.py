@@ -187,7 +187,7 @@ class SchedulingEnv(gym.Env):
                     coef = 1.0
 
                 rate = self.COST_TARD if diff > 0 else self.COST_HOLD
-                val_weight = order_area / self.plate_area
+                val_weight = order_area
                 jit_cost += val_weight * (rate * coef) * abs(diff)
 
             # 归一化并截断

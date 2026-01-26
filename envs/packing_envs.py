@@ -32,7 +32,7 @@ class NestingSchedulingEnv(gym.Env):
         self.episode_time_scale = 100.0
 
         # === 2. 权重配置 ===
-        self.w_util = 5.0
+        self.w_util = 4.0
         self.w_jit = 4.0
         self.w_grouping = 0.5
         self.w_step_compact = 0.5
@@ -223,8 +223,7 @@ class NestingSchedulingEnv(gym.Env):
                 else:
                     coef = 1.0
 
-                # 归一化价值权重
-                val_weight = order_value / (self.plate_w * self.plate_h)
+                val_weight = order_value
 
                 if diff > 0:
                     cost_jit += val_weight * (self.COST_TARD * coef) * abs_diff
@@ -262,7 +261,6 @@ class NestingSchedulingEnv(gym.Env):
         return self._get_obs(), reward, terminated, False, info
 
     def _simulate_batch_scheduling_detailed(self, plates_list):
-        """全量仿真：确保与 SchedulingEnv 维度一致"""
         temp_sched = SchedulerStateMachine(num_machines=3)
         tasks = []
         for idx, plate in enumerate(plates_list):
@@ -278,10 +276,9 @@ class NestingSchedulingEnv(gym.Env):
             best_task_idx, best_mach_idx = -1, -1
 
             if self.scheduler_model:
-                # 🟢 使用配置的 MAX_SCHED_TASKS_CAPACITY
                 MAX_SIM = self.max_sched_capacity
 
-                # 构造 Observation (必须与 SchedulingEnv 一致)
+                # 构造 Observation
                 safe_scale = max(1.0, self.episode_time_scale)
                 m_feat = (mach_times - min_t) / safe_scale
                 t_feat = []
