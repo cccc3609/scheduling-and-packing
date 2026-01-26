@@ -9,13 +9,11 @@ from sb3_contrib import MaskablePPO
 from sb3_contrib.common.maskable.utils import get_action_masks
 from sb3_contrib.common.wrappers import ActionMasker
 
-# 引入项目模块
 from envs.packing_envs import NestingSchedulingEnv
 from envs.scheduling_env import SchedulingEnv
 from models.attention_extractor import AttentionFeatureExtractor
 from config import COST_CONFIG, TRAIN_CONFIG
 
-# 配置字体
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial']
 plt.rcParams['axes.unicode_minus'] = False
 
@@ -29,9 +27,6 @@ def get_colors(n):
 
 
 def find_latest_experiment_models(exp_root="./experiments"):
-    """
-    自动查找 experiments 文件夹下最新的实验，以及该实验中最新的、成对的 Cycle 模型
-    """
     if not os.path.exists(exp_root):
         print(f"Error: Experiment directory not found: {exp_root}")
         return None, None, None
@@ -41,7 +36,6 @@ def find_latest_experiment_models(exp_root="./experiments"):
         print("Error: No experiment records found")
         return None, None, None
 
-    # 按时间倒序排序实验文件夹
     exp_dirs.sort(key=os.path.getctime, reverse=True)
 
     for latest_exp in exp_dirs:
@@ -49,7 +43,6 @@ def find_latest_experiment_models(exp_root="./experiments"):
         if not os.path.exists(model_dir):
             continue
 
-        # 1. 扫描所有排样模型序号
         nest_cycles = set()
         for f in os.listdir(model_dir):
             if f.startswith("nesting_c") and f.endswith(".zip"):
@@ -59,7 +52,6 @@ def find_latest_experiment_models(exp_root="./experiments"):
                 except:
                     pass
 
-        # 2. 扫描所有调度模型序号
         sched_cycles = set()
         for f in os.listdir(model_dir):
             if f.startswith("scheduling_c") and f.endswith(".zip"):
@@ -69,13 +61,11 @@ def find_latest_experiment_models(exp_root="./experiments"):
                 except:
                     pass
 
-        # 3. 取交集（确保两个模型都存在）
         valid_cycles = nest_cycles.intersection(sched_cycles)
 
         if not valid_cycles:
-            continue  # 这个实验文件夹里没有有效的成对模型，找下一个
+            continue 
 
-        # 找到最大且完整的轮次
         latest_c = max(valid_cycles)
         print(f"Locked Experiment: {os.path.basename(latest_exp)}")
         print(f"Loading Cycle: {latest_c} (Validated Pair)")
@@ -89,7 +79,6 @@ def find_latest_experiment_models(exp_root="./experiments"):
 
 
 def plot_nesting(plates, order_colors, save_dir=".", file_prefix="result"):
-    """绘制排样图 (支持文件前缀)"""
     total_plates = len(plates)
     if total_plates == 0: return
 
@@ -111,7 +100,6 @@ def plot_nesting(plates, order_colors, save_dir=".", file_prefix="result"):
     rows = math.ceil(total_plates / cols)
     fig, axes = plt.subplots(rows, cols, figsize=(16, 4 * rows))
 
-    # 动态标题
     fig.suptitle(f"Nesting Result ({file_prefix}): {total_plates} Plates\n{title_str}", y=0.99, fontsize=14)
 
     if rows * cols == 1: axes = np.array([axes])
@@ -144,7 +132,6 @@ def plot_nesting(plates, order_colors, save_dir=".", file_prefix="result"):
 
 
 def plot_gantt(logs, orders, order_colors, save_dir=".", file_prefix="result"):
-    """绘制甘特图 (支持文件前缀)"""
     if not logs: return
     machine_ids = sorted(list(set(t['machine_id'] for t in logs)))
     num_machines = len(machine_ids)
@@ -182,7 +169,6 @@ def plot_gantt(logs, orders, order_colors, save_dir=".", file_prefix="result"):
 
 
 def plot_jit_analysis(orders, metrics, save_dir=".", file_prefix="result"):
-    """绘制JIT分析面板 (支持文件前缀)"""
     if not orders: return
     order_ids, deviations, colors = [], [], []
     for oid, info in sorted(orders.items()):
@@ -260,7 +246,6 @@ def main():
 
     print("Generating Visualization...")
 
-    # 🟢 固定参数进行展示
     TEST_N = 50
     TEST_W = 200
     TEST_H = 200
