@@ -49,9 +49,10 @@ def setup_experiment():
         "custom_callbacks.py",
         "config.py",
         "evaluate_generalization.py",
-        "visualize_results.py",
+        "packing_envs.py",
+        "scheduling_envs.py",
         "evaluate_batch.py",
-        "test_result.py"  # 如果有的话
+        "test_result.py"
     ]
 
     for f in files_to_backup:
@@ -65,7 +66,7 @@ def setup_experiment():
         src = folder
         dst = os.path.join(code_dir, folder)
         if os.path.exists(src):
-            # 如果目标目录存在，先删除（虽然这里是新建的实验目录，通常不存在，但为了健壮性）
+            # 如果目标目录存在，先删除（
             if os.path.exists(dst):
                 shutil.rmtree(dst)
 
@@ -118,7 +119,7 @@ def main():
                               learning_rate=exponential_schedule(lr_start, lr_end),
                               n_steps=4096, batch_size=512, gamma=0.99, ent_coef=0.05,
                               tensorboard_log=log_s, verbose=1,
-                              max_grad_norm=0.5, clip_range=0.1)
+                              max_grad_norm=0.1, clip_range=0.1)
 
     nest_env.unwrapped.set_scheduling_partner(sched_model)
     sched_env.unwrapped.set_nesting_partner(nest_env, nest_model)
