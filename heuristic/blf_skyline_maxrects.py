@@ -32,6 +32,37 @@ class PlateLayoutManager:
         # BLF: 候选点列表 [(x, y), ...]
         self.blf_points = [(0.0, 0.0)]
 
+    def get_normalized_skyline(self, num_bins=20):
+        """
+        将连续的天际线离散化为固定长度的向量。
+        :param num_bins: 分辨率 (例如20)
+        :return: np.array [num_bins], 值在 0~1 之间 (相对于板高)
+        """
+        height_map = np.zeros(num_bins, dtype=np.float32)
+        bin_width = self.width / num_bins
+
+        # Skyline 是 [(x, y, width), ...]
+        for sx, sy, sw in self.skyline:
+            # 计算该线段覆盖了哪些 bin
+            start_idx = int(sx / bin_width)
+            end_idx = int((sx + sw) / bin_width)
+
+            # 防止浮点误差导致的越界
+            end_idx = min(end_idx, num_bins)
+
+            # 归一化高度
+            norm_h = sy / self.height
+
+            # 填充高度图
+            if start_idx < end_idx:
+                height_map[start_idx: end_idx] = norm_h
+            else:
+                # 处理极短线段落在单个bin内的情况
+                if start_idx < num_bins:
+                    height_map[start_idx] = max(height_map[start_idx], norm_h)
+
+        return height_map
+
     def place_part(self, part_w, part_h, order_id, strategy_id, min_rem_w=0.0, min_rem_h=0.0):
         """
         尝试放置零件。

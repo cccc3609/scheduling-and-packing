@@ -6,7 +6,7 @@ from gymnasium import spaces
 
 from heuristic.blf_skyline_maxrects import PlateLayoutManager
 from heuristic.scheduler import SchedulerStateMachine
-from config import MAX_PARTS_CAPACITY, TRAIN_CONFIG, MAX_SCHED_TASKS_CAPACITY, COST_CONFIG
+from config import MAX_PARTS_CAPACITY, TRAIN_CONFIG, MAX_SCHED_TASKS_CAPACITY, COST_CONFIG, FEATURE_CONFIG
 
 
 class NestingSchedulingEnv(gym.Env):
@@ -40,11 +40,11 @@ class NestingSchedulingEnv(gym.Env):
 
         # === 3. 空间定义 ===
         # 22维特征
-        self.obs_feature_dim = 22
-        self.num_strategies = 3
+        self.skyline_bins = FEATURE_CONFIG.get('skyline_bins', 20)
+        self.obs_feature_dim = 22 + self.skyline_bins
 
+        self.num_strategies = 3
         self.action_space = spaces.Discrete(self.max_capacity * 2 * self.num_strategies)
-        # 1D Flattened Observation
         self.observation_space = spaces.Box(
             low=-float('inf'), high=float('inf'),
             shape=(self.max_capacity * self.obs_feature_dim,), dtype=np.float32
@@ -52,15 +52,15 @@ class NestingSchedulingEnv(gym.Env):
 
         self.scheduler_state_machine = SchedulerStateMachine(num_machines=3)
         self.scheduler_model = None
-        self.parts_pool = []
-        self.orders = {}
+        self.parts_pool = [];
+        self.orders = {};
         self.packed_indices = set()
-        self.active_plates = []
-        self.history_plates = []
+        self.active_plates = [];
+        self.history_plates = [];
         self.cost_metrics = {}
-
         self.last_norm_util = 0.0
         self.last_norm_jit = 0.0
+        self.last_raw_jit = 0.0
 
     def set_scheduling_partner(self, model):
         self.scheduler_model = model
@@ -334,63 +334,60 @@ class NestingSchedulingEnv(gym.Env):
         return results
 
     def _generate_random_orders(self):
-        """
-        生成订单和零件。
-        逻辑：先生成零件，计算该订单的物理工时，再生成合理的交期。
-        """
-        data = []
-        orders = {}
-
-        # 统一使用 self.current_num_parts 计数
-        cnt = 0
-        oid = 0
-
-        # 估算全局工时 (用于生成交期背景)
+        #非均匀分布生成
+        data, orders = [], {}
+        cnt, oid = 0, 0
         avg_perim = 2 * (0.25 * self.plate_w + 0.25 * self.plate_h)
         total_work = self.current_num_parts * avg_perim
         est_makespan = (total_work / self.CUTTING_SPEED / 3) * 1.3
 
         while cnt < self.current_num_parts:
-            # 随机批量
             batch = np.random.randint(3, 9)
             if cnt + batch > self.current_num_parts: batch = self.current_num_parts - cnt
 
-            # 临时生成零件
             temp_parts = []
             order_p = 0
+
+            #  0: 混合均匀 (Standard)1: 大件主导 (Big Items) 2: 长条主导 (Long Strips) 3: 碎件主导 (Small Fragments) - 填缝
+            order_type = np.random.choice([0, 1, 2, 3], p=[0.4, 0.2, 0.2, 0.2])
+
             for _ in range(batch):
-                # 尺寸：板材的 15%~35%
-                w = int(np.random.uniform(0.15, 0.35) * self.plate_w)
-                h = int(np.random.uniform(0.15, 0.35) * self.plate_h)
+                if order_type == 1:  # Big
+                    w_r = np.random.uniform(0.3, 0.6)
+                    h_r = np.random.uniform(0.3, 0.6)
+                elif order_type == 2:  # Long
+                    if np.random.rand() > 0.5:
+                        w_r, h_r = np.random.uniform(0.6, 0.9), np.random.uniform(0.1, 0.2)
+                    else:
+                        w_r, h_r = np.random.uniform(0.1, 0.2), np.random.uniform(0.6, 0.9)
+                elif order_type == 3:  # Small
+                    w_r = np.random.uniform(0.05, 0.2)
+                    h_r = np.random.uniform(0.05, 0.2)
+                else:  # Standard
+                    w_r = np.random.uniform(0.1, 0.4)
+                    h_r = np.random.uniform(0.1, 0.4)
+
+                w = int(w_r * self.plate_w)
+                h = int(h_r * self.plate_h)
                 w, h = max(1, w), max(1, h)
+
+                # 随机翻转
                 if np.random.rand() > 0.5: w, h = h, w
+
                 order_p += 2 * (w + h)
                 temp_parts.append({'w': w, 'h': h, 'area': w * h})
 
-            # 计算该订单物理工时
             self_time = order_p / self.CUTTING_SPEED
-
-            # 交期 = 自身工时*1.2 + 随机排队
             base = self_time * np.random.uniform(1.1, 1.3)
             q = np.random.uniform(0, max(0, est_makespan - self_time))
             final_due = base + q
-
             orders[oid] = {'due_date': final_due, 'finished_time': 0.0}
 
-            # 存入零件池
-            # 这里的 p 就是你之前问的 temp_parts 循环里的变量
             for p in temp_parts:
-                data.append({
-                    'w': p['w'],
-                    'h': p['h'],
-                    'area': p['area'],
-                    'due_date': final_due,
-                    'order_id': oid,
-                    'original_idx': cnt
-                })
+                data.append({'w': p['w'], 'h': p['h'], 'area': p['area'], 'due_date': final_due, 'order_id': oid,
+                             'original_idx': cnt})
                 cnt += 1
             oid += 1
-
         np.random.shuffle(data)
         return data, orders
 
@@ -413,64 +410,138 @@ class NestingSchedulingEnv(gym.Env):
         return m
 
     def _get_obs(self):
-        obs = np.zeros((self.max_capacity, self.obs_feature_dim), dtype=np.float32)
-        curr_util = np.mean([p.utilization for p in self.active_plates]) if self.active_plates else 0.0
 
-        # 板材详细空闲特征
-        all_free = []
-        for p in self.active_plates: all_free.extend(p.free_rects)
-        tot_a = self.plate_w * self.plate_h * len(self.active_plates)
-        if all_free and tot_a > 0:
-            fr = sum([r[2] * r[3] for r in all_free]) / tot_a
-            mx = max([r[2] * r[3] for r in all_free]) / (self.plate_w * self.plate_h)
-            mw = max([r[2] for r in all_free]) / self.plate_w
-            mh = max([r[3] for r in all_free]) / self.plate_h
-        else:
-            fr, mx, mw, mh = 0, 0, 0, 0
+        # 初始化
+        obs = np.zeros((self.max_capacity, self.obs_feature_dim), dtype=np.float32)
+        skyline_feat = np.zeros(self.skyline_bins, dtype=np.float32)
+
+        act_util_avg = 0.0
+        act_util_max = 0.0
+        act_util_min = 0.0
+
+        act_free_area_ratio = 0.0
+        act_max_free_area = 0.0
+        max_free_w = 0.0
+        max_free_h = 0.0
 
         if self.active_plates:
-            us = [p.utilization for p in self.active_plates]
-            u_avg, u_max, u_min = np.mean(us), np.max(us), np.min(us)
+            target_plate = self.active_plates[-1]
+            skyline_feat = target_plate.get_normalized_skyline(self.skyline_bins)
+
+            # 利用率统计
+            utils = [p.utilization for p in self.active_plates]
+            act_util_avg = np.mean(utils)
+            act_util_max = np.max(utils)
+            act_util_min = np.min(utils)
+
+            # 空闲空间统计
+            all_free_rects = []
+            for p in self.active_plates:
+                all_free_rects.extend(p.free_rects)
+
+            total_plate_area = self.plate_w * self.plate_h
+            total_active_area = total_plate_area * len(self.active_plates)
+
+            if all_free_rects and total_active_area > 0:
+                # 剩余总面积比例
+                total_free_area = sum([r[2] * r[3] for r in all_free_rects])
+                act_free_area_ratio = total_free_area / total_active_area
+
+                # 最大连续空块 (归一化)
+                max_free_area_val = max([r[2] * r[3] for r in all_free_rects])
+                act_max_free_area = max_free_area_val / total_plate_area
+
+                # 最大可用宽高 (归一化)
+                max_free_w = max([r[2] for r in all_free_rects]) / self.plate_w
+                max_free_h = max([r[3] for r in all_free_rects]) / self.plate_h
+
+        # 活跃板材数量 (归一化)
+        act_cnt_norm = len(self.active_plates) / 10.0
+
+        # 2. 剩余零件统计
+
+        rem_idxs = [i for i in range(self.current_num_parts) if i not in self.packed_indices]
+
+        mach_times = self.scheduler_state_machine.get_state()
+        curr_time = np.min(mach_times)
+
+        # 归一化分母
+        total_plate_area_unit = self.plate_w * self.plate_h
+        safe_time_scale = max(1.0, self.episode_time_scale)
+
+        if rem_idxs:
+            rem_areas = [self.parts_pool[i]['area'] for i in rem_idxs]
+            rem_dues = [self.parts_pool[i]['due_date'] for i in rem_idxs]
+
+            # 面积特征
+            rem_avg_area = np.mean(rem_areas) / total_plate_area_unit
+            rem_max_area = np.max(rem_areas) / total_plate_area_unit
+            # 剩余总工作量 / 单板面积 / 10 (预估还需要几张板)
+            rem_total_ratio = (sum(rem_areas) / total_plate_area_unit) / 10.0
+
+            # 时间特征 (归一化)
+            rem_due_diffs = [(d - curr_time) / safe_time_scale for d in rem_dues]
+            rem_avg_due = np.mean(rem_due_diffs)
+            rem_min_due = np.min(rem_due_diffs)
+            rem_due_std = np.std(rem_due_diffs)
         else:
-            u_avg = u_max = u_min = 0.0
+            rem_avg_area = 0.0
+            rem_max_area = 0.0
+            rem_total_ratio = 0.0
+            rem_avg_due = 0.0
+            rem_min_due = 0.0
+            rem_due_std = 0.0
 
-        act_cnt = len(self.active_plates) / 10.0
-        prog = len(self.packed_indices) / max(1, self.current_num_parts)
+        progress = len(self.packed_indices) / max(1, self.current_num_parts)
 
-        rem = [i for i in range(self.current_num_parts) if i not in self.packed_indices]
-        curr_time = np.min(self.scheduler_state_machine.get_state())
-
-        if rem:
-            areas = [self.parts_pool[i]['area'] for i in rem]
-            dues = [self.parts_pool[i]['due_date'] for i in rem]
-            r_avg_a = np.mean(areas) / (self.plate_w * self.plate_h)
-            r_max_a = np.max(areas) / (self.plate_w * self.plate_h)
-            r_tot = sum(areas) / (self.plate_w * self.plate_h) / 10.0
-            d_diffs = [(d - curr_time) / self.episode_time_scale for d in dues]
-            r_avg_d, r_min_d, r_std_d = np.mean(d_diffs), np.min(d_diffs), np.std(d_diffs)
-        else:
-            r_avg_a = r_max_a = r_tot = r_avg_d = r_min_d = r_std_d = 0.0
+        # 3. 机器负载
 
         if self.scheduler_model:
-            m_rel = (self.scheduler_state_machine.get_state() - curr_time) / self.episode_time_scale
-            m_avg, m_std = np.mean(m_rel), np.std(m_rel)
+            m_rel = (mach_times - np.min(mach_times)) / safe_time_scale
+            mach_load_avg = np.mean(m_rel)
+            mach_load_std = np.std(m_rel)
         else:
-            m_avg, m_std = 0, 0
+            mach_load_avg = 0.0
+            mach_load_std = 0.0
 
-        g_feats = [prog, r_avg_a, r_max_a, r_tot, r_avg_d, r_min_d, r_std_d, act_cnt, u_avg, u_max, u_min, fr, mx, mw,
-                   mh, m_avg, m_std]
+        # 全局特征向量 (17维)
+        # [0:Progress, 1-6:Inventory, 7-14:Plates, 15-16:Machine]
+        global_feats = [
+            progress,  # 1
+            rem_avg_area, rem_max_area, rem_total_ratio,  # 3
+            rem_avg_due, rem_min_due, rem_due_std,  # 3
+            act_cnt_norm, act_util_avg, act_util_max, act_util_min,  # 4
+            act_free_area_ratio, act_max_free_area, max_free_w, max_free_h,  # 4
+            mach_load_avg, mach_load_std  # 2
+        ]
 
-        for i, p in enumerate(self.parts_pool):
-            pk = 1.0 if i in self.packed_indices else 0.0
-            nw, nh = p['w'] / self.plate_w, p['h'] / self.plate_h
-            na = p['area'] / (self.plate_w * self.plate_h)
-            rd = (p['due_date'] - curr_time) / self.episode_time_scale
-            obs[i] = [nw, nh, na, rd, pk] + g_feats
+        # 将 Skyline (20维) 转换为 List
+        skyline_list = skyline_feat.tolist()
 
-        obs = np.nan_to_num(obs, nan=0.0, posinf=5.0, neginf=-5.0)
-        obs = np.clip(obs, -5.0, 5.0)
+        # 填充每个零件的特征
+        for i in range(self.max_capacity):
+            # 只处理有效范围内的零件，Padding 部分保持 0
+            if i < self.current_num_parts:
+                part = self.parts_pool[i]
+                is_packed = 1.0 if i in self.packed_indices else 0.0
 
+                # 局部特征 (5维)
+                norm_w = part['w'] / self.plate_w
+                norm_h = part['h'] / self.plate_h
+                norm_area = part['area'] / total_plate_area_unit
+                rel_due = (part['due_date'] - curr_time) / safe_time_scale
 
+                local_feats = [norm_w, norm_h, norm_area, rel_due, is_packed]
+
+                # 拼接: Local(5) + Global(17) + Skyline(20) = 42维
+                full_feat = np.array(local_feats + global_feats + skyline_list, dtype=np.float32)
+
+                obs[i] = full_feat
+            else:
+                # Padding 部分全为 0 (Attention Extractor 会通过 Mask 忽略这些)
+                pass
+
+                # 必须打平为 1D 数组以符合 observation_space 定义
         return obs.flatten()
 
     def _get_action_mask(self):

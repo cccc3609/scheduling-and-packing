@@ -43,7 +43,7 @@ def setup_experiment():
     for d in [log_n, log_s, save_dir, code_dir]:
         os.makedirs(d, exist_ok=True)
 
-    # 🟢 备份根目录脚本 (增加 evaluate_batch.py, test_result.py 等)
+    # 备份根目录脚本
     files_to_backup = [
         "train_dual.py",
         "custom_callbacks.py",
@@ -60,7 +60,7 @@ def setup_experiment():
             shutil.copy(f, code_dir)
             print(f"Backed up file: {f}")
 
-    # 🟢 备份文件夹 (envs, heuristic, models)
+    # 备份
     folders_to_backup = ["envs", "heuristic", "models"]
     for folder in folders_to_backup:
         src = folder
@@ -78,7 +78,7 @@ def setup_experiment():
             )
             print(f"Backed up folder: {src}")
 
-    print(f"📦 Experiment initialized: {base_dir}")
+    print(f" Experiment initialized: {base_dir}")
     return log_n, log_s, save_dir
 
 
@@ -92,7 +92,7 @@ def main():
 
     pk_nest = dict(
         features_extractor_class=AttentionFeatureExtractor,
-        features_extractor_kwargs=dict(features_dim=256, item_dim=22, global_prefix_dim=0),
+        features_extractor_kwargs=dict(features_dim=256,item_dim=42, global_prefix_dim=0),
         activation_fn=nn.Tanh,
         net_arch=dict(pi=[512, 512, 256], vf=[512, 512, 256])
     )
@@ -130,7 +130,7 @@ def main():
     cycles = TRAIN_CONFIG['total_cycles']
     steps = TRAIN_CONFIG['steps_per_cycle']
 
-    print(f"🚀 Start Training... (Cycles: {cycles}, Steps: {steps})")
+    print(f"Start Training... (Cycles: {cycles}, Steps: {steps})")
     for c in range(cycles):
         print(f"\n===== Cycle {c + 1}/{cycles} =====")
         print(f">>> Nesting training")
