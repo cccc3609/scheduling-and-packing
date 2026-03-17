@@ -15,13 +15,13 @@ TRAIN_CONFIG = {
     "max_plate_dim": 350,
 
     # 交期因子范围
-    "due_date_factor_range": (1.1, 2.5),
+    "due_date_factor_range": (1.1, 3.5),
 
     "total_cycles": 100,
-    "steps_per_cycle": 30000,
+    "steps_per_cycle": 100000,
 
     # 学习率配置
-    "lr_start": 1e-3,
+    "lr_start": 1e-4,
     "lr_end": 1e-5
 }
 

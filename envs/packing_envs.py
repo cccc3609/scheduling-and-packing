@@ -189,11 +189,10 @@ class NestingSchedulingEnv(gym.Env):
             self.history_plates = self.active_plates
             final_plates = [p for p in self.history_plates if len(p.placed_parts) > 0]
 
-            # 1. 材料成本
             consumed_area = len(final_plates) * (self.plate_w * self.plate_h)
             cost_material = consumed_area * self.COST_MAT
 
-            # 2. JIT 成本
+
             order_finishes = self._simulate_batch_scheduling_detailed(final_plates)
 
             cost_jit = 0.0
@@ -202,11 +201,11 @@ class NestingSchedulingEnv(gym.Env):
             for oid, finish_time in order_finishes.items():
                 due = self.orders[oid]['due_date']
 
-                # 订单价值
+
                 order_parts = [p for p in self.parts_pool if p['order_id'] == oid]
                 order_value = sum([p['area'] for p in order_parts])
 
-                # 订单工时
+
                 order_perim = sum([2 * (p['w'] + p['h']) for p in order_parts])
                 order_proc_time = max(1.0, order_perim / self.CUTTING_SPEED)
 
@@ -233,15 +232,14 @@ class NestingSchedulingEnv(gym.Env):
 
             total_cost = cost_material + cost_jit
 
-            # 3. 奖励归一化
+
             total_part_area = sum([p['area'] for p in self.parts_pool])
             baseline_cost = total_part_area * self.COST_MAT
             if baseline_cost <= 0: baseline_cost = 1.0
 
-            # 目标：最小化 Total / Baseline
+
             scaled_reward = - (total_cost / baseline_cost) * 10.0
 
-            # 🟢 强力截断：防止梯度爆炸
             scaled_reward = np.clip(scaled_reward, -50.0, 50.0)
 
             reward += scaled_reward
@@ -278,7 +276,7 @@ class NestingSchedulingEnv(gym.Env):
             if self.scheduler_model:
                 MAX_SIM = self.max_sched_capacity
 
-                # 构造 Observation
+
                 safe_scale = max(1.0, self.episode_time_scale)
                 m_feat = (mach_times - min_t) / safe_scale
                 t_feat = []
@@ -288,7 +286,7 @@ class NestingSchedulingEnv(gym.Env):
                 for i in range(MAX_SIM):
                     if i < len(tasks):
                         t = tasks[i]
-                        # NormVal
+
                         norm_val = t['val'] / 140000.0
                         t_feat.extend([
                             t['cut'] / safe_scale,
@@ -303,7 +301,7 @@ class NestingSchedulingEnv(gym.Env):
                 if not has_v: mask = np.ones(MAX_SIM * 3, dtype=bool)
 
                 obs = np.concatenate([m_feat, t_feat]).astype(np.float32)
-                # 🟢 强力数值清洗
+
                 obs = np.nan_to_num(obs, nan=0.0, posinf=5.0, neginf=-5.0)
                 obs = np.clip(obs, -5.0, 5.0)
 
@@ -428,13 +426,12 @@ class NestingSchedulingEnv(gym.Env):
             target_plate = self.active_plates[-1]
             skyline_feat = target_plate.get_normalized_skyline(self.skyline_bins)
 
-            # 利用率统计
+
             utils = [p.utilization for p in self.active_plates]
             act_util_avg = np.mean(utils)
             act_util_max = np.max(utils)
             act_util_min = np.min(utils)
 
-            # 空闲空间统计
             all_free_rects = []
             for p in self.active_plates:
                 all_free_rects.extend(p.free_rects)
@@ -443,22 +440,22 @@ class NestingSchedulingEnv(gym.Env):
             total_active_area = total_plate_area * len(self.active_plates)
 
             if all_free_rects and total_active_area > 0:
-                # 剩余总面积比例
+
                 total_free_area = sum([r[2] * r[3] for r in all_free_rects])
                 act_free_area_ratio = total_free_area / total_active_area
 
-                # 最大连续空块 (归一化)
+
                 max_free_area_val = max([r[2] * r[3] for r in all_free_rects])
                 act_max_free_area = max_free_area_val / total_plate_area
 
-                # 最大可用宽高 (归一化)
+
                 max_free_w = max([r[2] for r in all_free_rects]) / self.plate_w
                 max_free_h = max([r[3] for r in all_free_rects]) / self.plate_h
 
-        # 活跃板材数量 (归一化)
+
         act_cnt_norm = len(self.active_plates) / 10.0
 
-        # 2. 剩余零件统计
+
 
         rem_idxs = [i for i in range(self.current_num_parts) if i not in self.packed_indices]
 
@@ -473,13 +470,12 @@ class NestingSchedulingEnv(gym.Env):
             rem_areas = [self.parts_pool[i]['area'] for i in rem_idxs]
             rem_dues = [self.parts_pool[i]['due_date'] for i in rem_idxs]
 
-            # 面积特征
+
             rem_avg_area = np.mean(rem_areas) / total_plate_area_unit
             rem_max_area = np.max(rem_areas) / total_plate_area_unit
-            # 剩余总工作量 / 单板面积 / 10 (预估还需要几张板)
+
             rem_total_ratio = (sum(rem_areas) / total_plate_area_unit) / 10.0
 
-            # 时间特征 (归一化)
             rem_due_diffs = [(d - curr_time) / safe_time_scale for d in rem_dues]
             rem_avg_due = np.mean(rem_due_diffs)
             rem_min_due = np.min(rem_due_diffs)
@@ -494,7 +490,6 @@ class NestingSchedulingEnv(gym.Env):
 
         progress = len(self.packed_indices) / max(1, self.current_num_parts)
 
-        # 3. 机器负载
 
         if self.scheduler_model:
             m_rel = (mach_times - np.min(mach_times)) / safe_time_scale
@@ -504,8 +499,7 @@ class NestingSchedulingEnv(gym.Env):
             mach_load_avg = 0.0
             mach_load_std = 0.0
 
-        # 全局特征向量 (17维)
-        # [0:Progress, 1-6:Inventory, 7-14:Plates, 15-16:Machine]
+        # 全局特征向量
         global_feats = [
             progress,  # 1
             rem_avg_area, rem_max_area, rem_total_ratio,  # 3
@@ -515,17 +509,17 @@ class NestingSchedulingEnv(gym.Env):
             mach_load_avg, mach_load_std  # 2
         ]
 
-        # 将 Skyline (20维) 转换为 List
+
         skyline_list = skyline_feat.tolist()
 
-        # 填充每个零件的特征
+
         for i in range(self.max_capacity):
-            # 只处理有效范围内的零件，Padding 部分保持 0
+
             if i < self.current_num_parts:
                 part = self.parts_pool[i]
                 is_packed = 1.0 if i in self.packed_indices else 0.0
 
-                # 局部特征 (5维)
+
                 norm_w = part['w'] / self.plate_w
                 norm_h = part['h'] / self.plate_h
                 norm_area = part['area'] / total_plate_area_unit
@@ -533,15 +527,14 @@ class NestingSchedulingEnv(gym.Env):
 
                 local_feats = [norm_w, norm_h, norm_area, rel_due, is_packed]
 
-                # 拼接: Local(5) + Global(17) + Skyline(20) = 42维
+
                 full_feat = np.array(local_feats + global_feats + skyline_list, dtype=np.float32)
 
                 obs[i] = full_feat
             else:
-                # Padding 部分全为 0 (Attention Extractor 会通过 Mask 忽略这些)
+
                 pass
 
-                # 必须打平为 1D 数组以符合 observation_space 定义
         return obs.flatten()
 
     def _get_action_mask(self):

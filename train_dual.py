@@ -104,7 +104,7 @@ def main():
         net_arch=dict(pi=[256, 256], vf=[256, 256])
     )
 
-    # 参数保持保守设置
+
     lr_start = TRAIN_CONFIG.get('lr_start', 3e-4)
     lr_end = TRAIN_CONFIG.get('lr_end', 1e-5)
 
@@ -125,7 +125,7 @@ def main():
     sched_env.unwrapped.set_nesting_partner(nest_env, nest_model)
 
     cb = CallbackList(
-        [CheckpointCallback(50000, save_dir, 'nest'), TensorboardCallback(), SnapshotCallback(20000, log_n)])
+        [CheckpointCallback(100000, save_dir, 'nest'), TensorboardCallback(), SnapshotCallback(50000, log_n)])
 
     cycles = TRAIN_CONFIG['total_cycles']
     steps = TRAIN_CONFIG['steps_per_cycle']
