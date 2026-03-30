@@ -47,15 +47,26 @@ def find_latest_in_dir(model_dir):
     if not os.path.exists(model_dir): return None, None
     files = os.listdir(model_dir)
     cycles = []
+
+    # 优先寻找联合微调 (Phase 3) 的最新模型
     for f in files:
-        if "nesting_c" in f:
+        if "nesting_joint_c" in f:
             try:
-                cycles.append(int(f.split("_c")[1].split(".zip")[0]))
+                cycles.append(int(f.split("_joint_c")[1].split(".zip")[0]))
             except:
                 pass
-    if not cycles: return None, None
-    latest = max(cycles)
-    return os.path.join(model_dir, f"nesting_c{latest}"), os.path.join(model_dir, f"scheduling_c{latest}")
+
+    if cycles:
+        latest = max(cycles)
+        return os.path.join(model_dir, f"nesting_joint_c{latest}"), os.path.join(model_dir,
+                                                                                 f"scheduling_joint_c{latest}")
+
+    # 如果没找到 Phase 3，尝试加载 Phase 1 和 Phase 2 的独立模型
+    if "nesting_phase1.zip" in files and "scheduling_phase2.zip" in files:
+        print("💡 未检测到联合微调模型，降级使用 Phase 1 & 2 预热模型。")
+        return os.path.join(model_dir, "nesting_phase1"), os.path.join(model_dir, "scheduling_phase2")
+
+    return None, None
 
 
 def run_evaluation():
