@@ -29,8 +29,8 @@ class NestingSchedulingEnv(gym.Env):
         self.episode_time_scale = 100.0
 
         # === 2. 权重配置 ===
-        self.w_util = 4.0
-        self.w_jit = 4.0
+        self.w_util = 1.0
+        self.w_jit = 12.0
         self.w_grouping = 0.5
         self.w_step_compact = 0.5
         self.w_new_plate = 2.0
@@ -158,15 +158,28 @@ class NestingSchedulingEnv(gym.Env):
                 if score > best_score:
                     best_score, best_idx = score, idx
 
-        # ===== 后续的 if best_idx != -1: 逻辑保持不变 =====
+        # ==========================================================
+        # ⚠️ 修复了缩进：以下动作执行逻辑必须在 for 循环的外部！
+        # ==========================================================
         if best_idx != -1:
             target = self.active_plates[best_idx]
+            old_util = target.utilization  # 记录排入前的利用率
+
             s, x, y, w, h, _ = target.place_part(part_w, part_h, part['order_id'], strategy_id)
             # 如果 RL 选的策略排不下（被干涉），触发兜底机制：强制用最保守的 MaxRects (策略2) 补救
             if not s:
                 s, x, y, w, h, _ = target.place_part(part_w, part_h, part['order_id'], 2)
-            reward += 0.1
 
+            new_util = target.utilization  # 记录排入后的利用率
+
+            # ==========================================================
+            # 🔥 空间密集奖励 1：缝隙填得越满，立刻给加分！
+            # ==========================================================
+            reward += (new_util - old_util) * 20.0
+
+            # ==========================================================
+            # 🔥 时间密集惩罚：(保留项目原有的核心灵魂，防止急缓混排)
+            # ==========================================================
             oids = list(set([int(p[4]) for p in target.placed_parts]))
             if len(oids) > 1:
                 dues = [self.orders[o]['due_date'] for o in oids if o in self.orders]
@@ -175,10 +188,11 @@ class NestingSchedulingEnv(gym.Env):
                     step_jit_penalty = (due_std / max(1.0, self.episode_time_scale)) * self.w_grouping
                     reward -= step_jit_penalty
 
+            # 原有的紧凑度奖励代码
             cx_sum, cy_sum, count = 0, 0, 0
             for p in target.placed_parts:
-                cx_sum += p[0] + p[2] / 2;
-                cy_sum += p[1] + p[3] / 2;
+                cx_sum += p[0] + p[2] / 2
+                cy_sum += p[1] + p[3] / 2
                 count += 1
             curr_cx, curr_cy = x + w / 2, y + h / 2
             max_d = (self.plate_w ** 2 + self.plate_h ** 2) ** 0.5
@@ -188,9 +202,22 @@ class NestingSchedulingEnv(gym.Env):
             else:
                 d = (curr_cx ** 2 + curr_cy ** 2) ** 0.5
                 reward += (1.0 - d / max_d) * self.w_step_compact
+
         else:
+            # ============================================================
+            # 🔥 空间密集惩罚 2 (核武器)：开新板子时的“废料暴击”！
+            # ============================================================
+            if self.active_plates:
+                # 当 RL 决定开新板子时，意味着上一张板子被永远“封印”了。
+                # 此时立刻清算上一张板子的浪费率！
+                last_plate = self.active_plates[-1]
+                waste_ratio = 1.0 - last_plate.utilization
+
+                # 如果上一张板子还空着 40%，RL 却不去选“填缝件”，而是强行开新板，立刻遭受重罚！
+                reward -= waste_ratio * 50.0
+
             new_plate = PlateLayoutManager(width=self.plate_w, height=self.plate_h)
-            s, x, y, w, h, _ = new_plate.place_part(part['w'], part['h'], part['order_id'], strategy_id)
+            s, x, y, w, h, _ = new_plate.place_part(part_w, part_h, part['order_id'], strategy_id)
             if s:
                 self.active_plates.append(new_plate)
                 reward -= self.w_new_plate
@@ -198,7 +225,7 @@ class NestingSchedulingEnv(gym.Env):
                 reward -= 50.0
 
         terminated = len(self.packed_indices) == self.current_num_parts
-        info = {}
+        info = {}  # ⚠️ 修复：必须初始化 info 字典
 
         if terminated:
             self.history_plates = self.active_plates
@@ -209,12 +236,11 @@ class NestingSchedulingEnv(gym.Env):
             consumed_area = len(final_plates) * (self.plate_w * self.plate_h)
             utilization = total_part_area / consumed_area if consumed_area > 0 else 0.001
 
-
             wasted_area = max(0.0, consumed_area - total_part_area)
             cost_material = wasted_area * self.COST_MAT  # 这里的成本变成了“纯浪费罚款”
 
             # --- 下游：调度与 JIT 成本计算 ---
-            order_finishes = self._simulate_batch_scheduling_detailed(final_plates)
+            order_finishes = self._simulate_with_edd(final_plates)
 
             cost_jit, total_delay = 0.0, 0.0
             for oid, finish_time in order_finishes.items():
@@ -276,66 +302,37 @@ class NestingSchedulingEnv(gym.Env):
         info["action_mask"] = self._get_action_mask()
         return self._get_obs(), reward, terminated, False, info
 
-    def _simulate_batch_scheduling_detailed(self, plates_list):
-        temp_sched = SchedulerStateMachine(num_machines=3)
+    def _simulate_with_edd(self, plates_list):
+        """
+        固定 EDD（最早交期优先）启发式调度，用于 nesting 终局奖励计算。
+        使用局部 orders 副本，绝不修改 self.orders。
+        信号稳定，不随 scheduling agent 训练状态变化。
+        """
+        import copy
+        local_orders = {oid: {'due_date': v['due_date'], 'finished_time': 0.0}
+                        for oid, v in self.orders.items()}
+
         tasks = []
         for idx, plate in enumerate(plates_list):
             cut_time = sum([2 * (p[2] + p[3]) for p in plate.placed_parts]) / self.CUTTING_SPEED
             oids = list(set([int(p[4]) for p in plate.placed_parts]))
-            min_due = min([self.orders[o]['due_date'] for o in oids]) if oids else 999.0
-            val = sum([p[2] * p[3] for p in plate.placed_parts])
-            tasks.append({'cut': cut_time, 'due': min_due, 'idx': idx, 'oids': oids, 'val': val, 'done': False})
+            min_due = min([local_orders[o]['due_date'] for o in oids if o in local_orders],
+                          default=999.0)
+            tasks.append({'cut': cut_time, 'due': min_due, 'oids': oids})
 
-        for _ in range(len(tasks)):
-            mach_times = temp_sched.get_state()
-            min_t = np.min(mach_times)
-            best_task_idx, best_mach_idx = -1, -1
+        # EDD 排序后贪心分配最早空闲机器
+        tasks.sort(key=lambda t: t['due'])
+        machine_times = [0.0] * self.scheduler_state_machine.num_machines
 
-            if self.scheduler_model:
-                safe_scale = max(1.0, self.episode_time_scale)
-                m_feat = (mach_times - min_t) / safe_scale
-                t_feat = []
-                mask = np.zeros(self.max_sched_capacity * 3, dtype=bool)
-                has_v = False
+        for task in tasks:
+            m_idx = int(min(range(len(machine_times)), key=lambda m: machine_times[m]))
+            end_t = machine_times[m_idx] + task['cut']
+            machine_times[m_idx] = end_t
+            for oid in task['oids']:
+                if oid in local_orders:
+                    local_orders[oid]['finished_time'] = max(local_orders[oid]['finished_time'], end_t)
 
-                dummy_upstream = [0.0, 0.0, 0.0]
-
-                for i in range(self.max_sched_capacity):
-                    if i < len(tasks):
-                        t = tasks[i]
-                        t_feat.extend(
-                            [t['cut'] / safe_scale, (t['due'] - min_t) / safe_scale, 1.0 if t['done'] else 0.0,
-                             t['val'] / 140000.0])
-                        if not t['done']: mask[i * 3:(i + 1) * 3] = True; has_v = True
-                    else:
-                        t_feat.extend([0, 0, 1, 0])
-
-                if not has_v: mask = np.ones(self.max_sched_capacity * 3, dtype=bool)
-                obs = np.concatenate([m_feat, dummy_upstream, t_feat]).astype(np.float32)
-                obs = np.clip(np.nan_to_num(obs, nan=0.0, posinf=5.0, neginf=-5.0), -5.0, 5.0)
-
-                action, _ = self.scheduler_model.predict(obs, action_masks=mask, deterministic=True)
-                best_task_idx = int(action) // 3
-                best_mach_idx = int(action) % 3
-            else:
-                min_cost = float('inf')
-                for i, t in enumerate(tasks):
-                    if t['done']: continue
-                    for m in range(3):
-                        end = mach_times[m] + t['cut']
-                        diff = end - t['due']
-                        cost = self.COST_TARD * diff if diff > 0 else self.COST_HOLD * abs(diff)
-                        cost += (mach_times[m] - min_t) * 0.1
-                        if cost < min_cost: min_cost, best_task_idx, best_mach_idx = cost, i, m
-
-            if best_task_idx != -1:
-                task = tasks[best_task_idx]
-                task['done'] = True
-                end_t = temp_sched.execute_assignment(best_mach_idx, task['cut'], task['idx'])
-                for oid in task['oids']: self.orders[oid]['finished_time'] = max(self.orders[oid]['finished_time'],
-                                                                                 end_t)
-
-        return {oid: order['finished_time'] for oid, order in self.orders.items()}
+        return {oid: v['finished_time'] for oid, v in local_orders.items()}
 
 
 
@@ -367,7 +364,7 @@ class NestingSchedulingEnv(gym.Env):
 
                     # 随机翻转长宽
                     if np.random.rand() > 0.5:
-                        w_ratio, h_range = h_ratio, w_ratio
+                        w_ratio, h_ratio = h_ratio, w_ratio
 
                     w = max(1, int(w_ratio * self.plate_w))
                     h = max(1, int(h_ratio * self.plate_h))
@@ -498,25 +495,42 @@ class NestingSchedulingEnv(gym.Env):
         return obs.flatten()
 
     def _get_action_mask(self):
-        # 动作空间是 max_capacity * 2 * 3 = 120 * 6 = 720
         total_actions = self.max_capacity * 6
-        mask = np.zeros(total_actions, dtype=bool)
+        mask = __import__('numpy').zeros(total_actions, dtype=bool)
+        import numpy as _np
 
         if len(self.packed_indices) >= self.current_num_parts:
-            return np.ones(total_actions, dtype=bool)
+            return _np.ones(total_actions, dtype=bool)
 
         unpacked_idxs = [i for i in range(self.current_num_parts) if i not in self.packed_indices]
 
-        # 🔥 混合启发式截断：我们不限制策略和旋转，只限制“选什么零件”
-        # A. 选面积最大的前 5 个 (对抗 Baseline 的材料利用率)
-        top_area_idxs = sorted(unpacked_idxs, key=lambda i: self.parts_pool[i]['area'], reverse=True)[:5]
-        # B. 选交期最紧迫的前 5 个 (发挥 RL 的 JIT 调度优势)
-        top_due_idxs = sorted(unpacked_idxs, key=lambda i: self.parts_pool[i]['due_date'])[:5]
+        # 战术 1: FFD — 面积最大的 2 个（奠基件）
+        top_area_idxs = sorted(unpacked_idxs, key=lambda i: self.parts_pool[i]['area'], reverse=True)[:2]
 
-        # 取并集，最多 10 个精英零件候选
-        candidate_set = set(top_area_idxs + top_due_idxs)
+        # 战术 2: EDD — 交期最急的 2 个（保交期）
+        top_due_idxs = sorted(unpacked_idxs, key=lambda i: self.parts_pool[i]['due_date'])[:2]
 
-        # 🔥 为这几个精英零件，开放所有的旋转和策略权限 (共 6 个动作)
+        # 战术 3: 填缝 — 当前板材最大空矩形能容纳的件中，面积最大的 2 个
+        # ✅ 修复：从"全局最小"改为"当前空间可容纳"
+        bottom_area_idxs = []
+        if self.active_plates and self.active_plates[-1].free_rects:
+            free_rects = self.active_plates[-1].free_rects
+            max_free_w = max(r[2] for r in free_rects)
+            max_free_h = max(r[3] for r in free_rects)
+            # 能放入（考虑旋转）的候选件
+            fittable = [
+                i for i in unpacked_idxs
+                if (self.parts_pool[i]['w'] <= max_free_w and self.parts_pool[i]['h'] <= max_free_h)
+                   or (self.parts_pool[i]['h'] <= max_free_w and self.parts_pool[i]['w'] <= max_free_h)
+            ]
+            bottom_area_idxs = sorted(fittable, key=lambda i: self.parts_pool[i]['area'], reverse=True)[:2]
+
+        # fallback：板材全满时回退到全局最小面积
+        if not bottom_area_idxs:
+            bottom_area_idxs = sorted(unpacked_idxs, key=lambda i: self.parts_pool[i]['area'])[:2]
+
+        candidate_set = set(top_area_idxs + top_due_idxs + bottom_area_idxs)
+
         for i in candidate_set:
             mask[i * 6: (i + 1) * 6] = True
 

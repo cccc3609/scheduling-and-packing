@@ -128,8 +128,14 @@ def run_evaluation():
         NUM_EPISODES = 20
 
         for i in tqdm(range(NUM_EPISODES), desc=f"Scenario: {safe_name}"):
+            # 🟢 强行锁死全局随机种子
+            seed_val = 2000 + i
+            np.random.seed(seed_val)
+            import random  # 文件头记得 import random
+            random.seed(seed_val)
+
             # 🟢 动态重置环境参数
-            obs, _ = nest_env.reset(seed=2000 + i, options={
+            obs, _ = nest_env.reset(seed=seed_val, options={
                 "num_parts": num_parts,
                 "plate_size": plate_size
             })

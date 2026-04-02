@@ -2,7 +2,7 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 import copy
-from config import MAX_SCHED_TASKS_CAPACITY, COST_CONFIG
+from config import MAX_SCHED_TASKS_CAPACITY, COST_CONFIG,TRAIN_CONFIG
 
 class SchedulingEnv(gym.Env):
     def __init__(self, num_machines=3, max_tasks=None):
@@ -32,6 +32,8 @@ class SchedulingEnv(gym.Env):
         self.orders_snapshot = {}
         self.nesting_env = None
         self.nesting_model = None
+        _max_dim = TRAIN_CONFIG.get('max_plate_dim', 300)
+        self.val_norm = float(_max_dim * _max_dim)  # 单板最大面积，用于归一化板材价值特征
 
     def set_nesting_partner(self, env, model):
         self.nesting_env = env
@@ -109,7 +111,7 @@ class SchedulingEnv(gym.Env):
         for i in range(self.max_tasks):
             if i < len(self.task_pool):
                 t = self.task_pool[i]
-                t_feat.extend([t['cut']/scale, (t['due']-min_t)/scale, 1.0 if self.scheduled_mask[i] else 0.0, t['val']/140000.0])
+                t_feat.extend([t['cut']/scale, (t['due']-min_t)/scale, 1.0 if self.scheduled_mask[i] else 0.0, t['val']/self.val_norm])
             else:
                 t_feat.extend([0.0, 0.0, 1.0, 0.0])
 
@@ -119,6 +121,7 @@ class SchedulingEnv(gym.Env):
         return obs
 
     def step(self, action):
+        import numpy as _np
         action = int(action)
         t_idx, m_idx = action // self.num_machines, action % self.num_machines
 
@@ -127,8 +130,15 @@ class SchedulingEnv(gym.Env):
 
         task = self.task_pool[t_idx]
         curr_machine_time = self.machine_times[m_idx]
-        lazy_start = task['due'] - task['cut']
-        start = max(curr_machine_time, lazy_start)
+
+        # ✅ 修复：lazy start 仅在所有机器繁忙时生效，避免多机场景下的空转浪费
+        min_machine_time = _np.min(self.machine_times)
+        all_busy = _np.all(self.machine_times > min_machine_time + 1e-6)
+        if all_busy:
+            lazy_start = task['due'] - task['cut']
+            start = max(curr_machine_time, lazy_start)
+        else:
+            start = curr_machine_time  # 有机器空闲，立即开工
 
         end = start + task['cut']
         self.machine_times[m_idx] = end
@@ -136,11 +146,12 @@ class SchedulingEnv(gym.Env):
 
         for oid in task['oids']:
             if oid in self.orders_snapshot:
-                self.orders_snapshot[oid]['finished_time'] = max(self.orders_snapshot[oid]['finished_time'], end)
+                self.orders_snapshot[oid]['finished_time'] = max(
+                    self.orders_snapshot[oid]['finished_time'], end)
 
-        reward = - (np.std(self.machine_times) * 0.01)
+        reward = -(_np.std(self.machine_times) * 0.01)
         valid = len(self.task_pool)
-        done = (np.sum(self.scheduled_mask[:valid]) == valid)
+        done = (_np.sum(self.scheduled_mask[:valid]) == valid)
 
         if done:
             jit_cost = 0.0
@@ -148,14 +159,17 @@ class SchedulingEnv(gym.Env):
                 diff = order['finished_time'] - order['due_date']
                 ratio = abs(diff) / order.get('proc_time', 1.0)
                 R_FREE, R_FULL = 0.025, 0.075
-                if ratio <= R_FREE: coef = 0.0
-                elif ratio <= R_FULL: coef = (ratio - R_FREE) / (R_FULL - R_FREE)
-                else: coef = 1.0
+                if ratio <= R_FREE:
+                    coef = 0.0
+                elif ratio <= R_FULL:
+                    coef = (ratio - R_FREE) / (R_FULL - R_FREE)
+                else:
+                    coef = 1.0
 
                 rate = self.COST_TARD if diff > 0 else self.COST_HOLD
                 jit_cost += order.get('total_area', 1.0) * (rate * coef) * abs(diff)
 
-            norm_reward = np.clip(- (jit_cost / self.baseline_cost) * 10.0, -20.0, 20.0)
+            norm_reward = _np.clip(-(jit_cost / self.baseline_cost) * 10.0, -20.0, 20.0)
             reward += norm_reward
 
         return self._get_obs(), reward, done, False, {}
