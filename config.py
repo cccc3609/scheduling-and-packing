@@ -44,11 +44,11 @@ TRAIN_CONFIG = {
     'max_plate_dim': 250,
 
     # 【课程式训练节奏控制】
-    'total_cycles': 20,  # 总循环数。保障扣除 Phase 1 & 2 之后，有足够轮数微调
+    'total_cycles': 50,  # 总循环数。保障扣除 Phase 1 & 2 之后，有足够轮数微调
 
     # 【核心提速】：加快 Tensorboard 反馈频率
     # 原本 100,000 步太久了。现在改为 30,000 步保存一次并更新指标。
-    'steps_per_cycle': 30000,
+    'steps_per_cycle': 50000,
 
     # 学习率退火策略
     'lr_start': 3e-4,  # 初始探索学习率
