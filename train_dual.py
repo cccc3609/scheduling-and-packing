@@ -1,16 +1,22 @@
 """
-train_dual.py  —  自定义 PPO 训练循环，完全绕开 SB3
+train_dual.py  —  协同优化训练循环
 
 架构：
-  Nesting  : NestingModel（PartEncoder + StepDecoder + PointerActorHead）
-             Encoder-Decoder 解耦：每局只跑一次 Encoder，每步只跑轻量 Decoder
-  Scheduling: MaskablePPO（sb3_contrib）+ AttentionFeatureExtractor
-              调度侧动作空间较小，继续使用 SB3 简化工程
+  Nesting  : NestingModel + NestingResultEncoder（自定义 PPO）
+  Scheduling: MaskablePPO（sb3_contrib）+ AttentionFeatureExtractor + SchedulingIntentEncoder
+
+协同优化改进：
+  1. 联合终局奖励：Nesting 终局时调用真实 Scheduling agent 做调度 rollout，
+     用真实 JIT 成本替代 EDD 代理 → 两个 agent 优化同一个目标函数
+  2. 可训练通信：NestingResultEncoder 参数纳入 Nesting 优化器，
+     SchedulingIntentEncoder 参数纳入 Scheduling 的 policy parameters
+     → 通信向量可被梯度更新，携带真实策略意图
+  3. Phase 3 联合微调时学习率余弦退火
 
 训练流程：
-  Phase 1: Nesting 预热（自定义 PPO，无调度 partner）
-  Phase 2: Scheduling 适应（SB3 MaskablePPO，nesting partner = Phase1 模型）
-  Phase 3: 联合微调（交替更新）
+  Phase 1: Nesting 预热（EDD fallback，通信向量全零）
+  Phase 2: Scheduling 适应（nesting 冻结，scheduling 学习调度策略）
+  Phase 3: 联合微调（交替更新，联合终局奖励，通信梯度打通）
 """
 
 import os, shutil, datetime, math
@@ -21,7 +27,6 @@ import torch.optim as optim
 from torch.distributions import Categorical
 import torch.nn.functional as F
 
-# SB3 只用于 Scheduling 侧
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
@@ -78,7 +83,10 @@ def setup_experiment():
 class NestingPPO:
     """
     专为 NestingModel 设计的 PPO 训练器。
-    核心优化：Encoder 每局只跑一次，Decoder 每步只做轻量 Cross-Attention。
+
+    协同改进：
+    - NestingResultEncoder 的参数纳入 optimizer，使排样摘要向量可训练
+    - 通过 env 的 joint_reward_calc 使用真实调度结果计算终局奖励
     """
 
     def __init__(
@@ -109,47 +117,48 @@ class NestingPPO:
         self.n_steps     = n_steps
         self.batch_size  = batch_size
         self.n_epochs    = n_epochs
-        self.optimizer   = optim.Adam(model.parameters(), lr=lr)
         self.total_steps = 0
+
+        # 将 NestingResultEncoder 的参数也纳入优化器
+        # 这样排样摘要向量可以被 nesting 的梯度更新
+        all_params = list(model.parameters()) + list(env.nesting_result_encoder.parameters())
+        self.optimizer = optim.Adam(all_params, lr=lr)
+
+    def set_lr(self, new_lr: float):
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = new_lr
 
     def _to_tensor(self, x):
         return torch.as_tensor(x, dtype=torch.float32, device=self.device)
 
     def collect_rollout(self):
-        """
-        收集 n_steps 个转移样本。
-        关键：每个 episode 开始时只跑一次 PartEncoder，后续每步只跑 StepDecoder。
-        """
-        buf_part_feats  = []   # [T, N, 5]  — 零件静态特征（episode 级）
-        buf_state_feats = []   # [T, 57]    — 当前动态状态
-        buf_actions     = []   # [T]
-        buf_log_probs   = []   # [T]
-        buf_values      = []   # [T]
-        buf_rewards     = []   # [T]
-        buf_dones       = []   # [T]
-        buf_masks       = []   # [T, 720]
+        buf_part_feats  = []
+        buf_state_feats = []
+        buf_actions     = []
+        buf_log_probs   = []
+        buf_values      = []
+        buf_rewards     = []
+        buf_dones       = []
+        buf_masks       = []
 
         obs, info = self.env.reset()
-        part_feats_np = self.env.get_part_feats()   # [120, 5]，episode 开始只取一次
-        H = None  # 延迟到第一步计算（确保在 no_grad 外）
+        part_feats_np = self.env.get_part_feats()
+        H = None
 
         ep_rewards = []
         ep_r = 0.0
 
         for _ in range(self.n_steps):
-            state_feat_np = self.env.get_state_feat()   # [57]，每步更新
-            action_mask   = self.env.unwrapped._get_action_mask()  # [720] bool
+            state_feat_np = self.env.get_state_feat()
+            action_mask   = self.env.unwrapped._get_action_mask()
 
-            pf_t  = self._to_tensor(part_feats_np).unsqueeze(0)    # [1, 120, 5]
-            sf_t  = self._to_tensor(state_feat_np).unsqueeze(0)    # [1, 57]
-            msk_t = self._to_tensor(action_mask).bool().unsqueeze(0)  # [1, 720]
+            pf_t  = self._to_tensor(part_feats_np).unsqueeze(0)
+            sf_t  = self._to_tensor(state_feat_np).unsqueeze(0)
+            msk_t = self._to_tensor(action_mask).bool().unsqueeze(0)
 
             with torch.no_grad():
-                # Encoder 只在 episode 开始时跑（H is None 或 episode 刚 reset）
                 if H is None:
-                    H = self.model.encode_parts(pf_t)              # [1, 120, 128]
-
-                # 只跑轻量 Decoder
+                    H = self.model.encode_parts(pf_t)
                 logits, value = self.model.decode_step(sf_t, H, msk_t)
                 dist   = Categorical(logits=logits)
                 action = dist.sample()
@@ -173,10 +182,10 @@ class NestingPPO:
                 ep_rewards.append(ep_r)
                 ep_r = 0.0
                 obs, info = self.env.reset()
-                part_feats_np = self.env.get_part_feats()  # 新 episode，更新零件特征
-                H = None                                    # 清空 H，下步重新 encode
+                part_feats_np = self.env.get_part_feats()
+                H = None
 
-        # 计算最后一步的 bootstrap value
+        # bootstrap
         with torch.no_grad():
             sf_last = self._to_tensor(self.env.get_state_feat()).unsqueeze(0)
             pf_last = self._to_tensor(part_feats_np).unsqueeze(0)
@@ -215,18 +224,17 @@ class NestingPPO:
                 b = idx[start: start + self.batch_size]
 
                 pf  = torch.stack([torch.as_tensor(buf_part_feats[i],  dtype=torch.float32)
-                                   for i in b]).to(self.device)   # [B, 120, 5]
+                                   for i in b]).to(self.device)
                 sf  = torch.stack([torch.as_tensor(buf_state_feats[i], dtype=torch.float32)
-                                   for i in b]).to(self.device)   # [B, 57]
+                                   for i in b]).to(self.device)
                 msk = torch.stack([torch.as_tensor(buf_masks[i], dtype=torch.bool)
-                                   for i in b]).to(self.device)   # [B, 720]
+                                   for i in b]).to(self.device)
                 old_lp = torch.as_tensor([buf_log_probs[i] for i in b],
                                          dtype=torch.float32, device=self.device)
                 act    = torch.as_tensor([buf_actions[i] for i in b],
                                          dtype=torch.long, device=self.device)
 
-                # Encoder 在训练时对 batch 完整跑（梯度需要流过 Encoder）
-                H      = self.model.encode_parts(pf)              # [B, 120, 128]
+                H      = self.model.encode_parts(pf)
                 logits, value = self.model.decode_step(sf, H, msk)
 
                 dist    = Categorical(logits=logits)
@@ -267,10 +275,6 @@ class NestingPPO:
             torch.save(self.model.state_dict(), f"{save_path}/{tag}_final.pt")
 
     def predict(self, env: NestingSchedulingEnv, deterministic: bool = True):
-        """
-        用于 SchedulingEnv.reset() 中驱动 nesting rollout。
-        返回 action（int）。
-        """
         part_feats = env.get_part_feats()
         state_feat = env.get_state_feat()
         mask       = env.unwrapped._get_action_mask()
@@ -290,11 +294,8 @@ class NestingPPO:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Scheduling 侧 — 仍用 SB3，但修正 item_dim / global_prefix_dim
+# Scheduling 侧
 # ─────────────────────────────────────────────────────────────────────────────
-# scheduling obs 结构：
-#   m_feat(3) + upstream(3) + nesting_result(8) = 14  ← global_prefix
-#   tasks: max_tasks × 4                              ← 序列部分，item_dim=4
 
 def make_sched_policy_kwargs():
     from config import MAX_SCHED_TASKS_CAPACITY
@@ -302,8 +303,8 @@ def make_sched_policy_kwargs():
         features_extractor_class=AttentionFeatureExtractor,
         features_extractor_kwargs=dict(
             features_dim=256,
-            item_dim=4,            # 修复：每个 task 特征维度是 4
-            global_prefix_dim=14,  # 修复：machines(3)+upstream(3)+nesting_result(8)
+            item_dim=4,
+            global_prefix_dim=14,
         ),
         activation_fn=nn.Tanh,
         net_arch=dict(pi=[256, 256], vf=[256, 256])
@@ -311,28 +312,45 @@ def make_sched_policy_kwargs():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NestingPPO 包装成 SB3-like predict 接口供 SchedulingEnv 使用
+# NestingModelPredictor — 带 H 缓存
 # ─────────────────────────────────────────────────────────────────────────────
 
 class NestingModelPredictor:
     """
-    让 SchedulingEnv 能像调用 SB3 model 一样调用 NestingPPO。
-    SchedulingEnv.reset() 里会调用:
-        a, _ = self.nesting_model.predict(obs, action_masks=m, deterministic=True)
-    这里把这个接口适配到 NestingPPO.predict()。
+    SB3-like predict 接口，带 H 缓存。
     """
 
     def __init__(self, ppo: NestingPPO, env: NestingSchedulingEnv):
         self.ppo = ppo
         self.env = env
+        self._H_cache = None
+
+    def reset_cache(self):
+        self._H_cache = None
 
     def predict(self, obs, action_masks=None, deterministic=True):
-        action = self.ppo.predict(self.env, deterministic=deterministic)
+        state_feat = self.env.get_state_feat()
+        mask       = self.env.unwrapped._get_action_mask()
+
+        sf  = self.ppo._to_tensor(state_feat).unsqueeze(0)
+        msk = self.ppo._to_tensor(mask).bool().unsqueeze(0)
+
+        with torch.no_grad():
+            if self._H_cache is None:
+                part_feats = self.env.get_part_feats()
+                pf = self.ppo._to_tensor(part_feats).unsqueeze(0)
+                self._H_cache = self.ppo.model.encode_parts(pf)
+
+            logits, _ = self.ppo.model.decode_step(sf, self._H_cache, msk)
+            if deterministic:
+                action = int(logits.argmax(dim=-1).item())
+            else:
+                action = int(Categorical(logits=logits).sample().item())
         return action, None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main
+# Main — 三阶段训练，Phase 2+ 启用联合终局奖励
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
@@ -344,12 +362,12 @@ def main():
     lr_end   = TRAIN_CONFIG.get('lr_end', 1e-5)
     steps    = TRAIN_CONFIG['steps_per_cycle']
 
-    # ── 环境 ──────────────────────────────────────────────────────────────────
+    # ── 环境 ──
     nest_env  = NestingSchedulingEnv()
     sched_env = SchedulingEnv()
     sched_env_masked = ActionMasker(sched_env, mask_fn)
 
-    # ── 模型 ──────────────────────────────────────────────────────────────────
+    # ── 模型 ──
     nesting_model = NestingModel(
         part_feat_dim=PART_FEAT_DIM,
         state_feat_dim=STATE_FEAT_DIM,
@@ -386,36 +404,49 @@ def main():
         max_grad_norm=0.1, clip_range=0.1
     )
 
-    # ── Phase 1：Nesting 预热 ─────────────────────────────────────────────────
-    print(f"\n{'='*50}\nPhase 1: Nesting Warm-up\n{'='*50}")
+    # ── Phase 1：Nesting 预热 ─────────────────────────────────────────────
+    # 此时无 scheduling partner，终局奖励用 EDD fallback
+    print(f"\n{'='*60}\nPhase 1: Nesting Warm-up (EDD fallback for terminal reward)\n{'='*60}")
     nest_env.set_scheduling_partner(None)
+    nest_env.set_scheduling_for_reward(None, None)  # 无真实调度
     nesting_ppo.learn(steps * 10, save_path=save_dir, tag="nesting_phase1")
 
-    # ── Phase 2：Scheduling 适应 ──────────────────────────────────────────────
-    print(f"\n{'='*50}\nPhase 2: Scheduling Adaptation\n{'='*50}")
-    # 给 SchedulingEnv 装载 nesting predictor
+    # ── Phase 2：Scheduling 适应 ──────────────────────────────────────────
+    print(f"\n{'='*60}\nPhase 2: Scheduling Adaptation\n{'='*60}")
     predictor = NestingModelPredictor(nesting_ppo, nest_env)
     sched_env.set_nesting_partner(ActionMasker(nest_env, mask_fn), predictor)
     sched_model.learn(steps * 10, reset_num_timesteps=False)
     sched_model.save(f"{save_dir}/scheduling_phase2")
 
-    # ── Phase 3：联合微调 ─────────────────────────────────────────────────────
-    print(f"\n{'='*50}\nPhase 3: Joint Fine-tuning\n{'='*50}")
+    # ── Phase 3：联合微调（核心改进）─────────────────────────────────────
+    # 启用联合终局奖励：Nesting 终局时调用真实 Scheduling agent
+    print(f"\n{'='*60}\nPhase 3: Joint Fine-tuning (real scheduling for terminal reward)\n{'='*60}")
     fine_tune_cycles = max(1, TRAIN_CONFIG['total_cycles'] - 20)
 
     for c in range(fine_tune_cycles):
-        print(f"\n===== Joint Cycle {c + 1} =====")
+        print(f"\n===== Joint Cycle {c + 1}/{fine_tune_cycles} =====")
 
-        # Nesting：接收调度 partner（SB3 model）
+        # 余弦退火
+        progress = c / max(1, fine_tune_cycles - 1)
+        cos_lr = lr_end + 0.5 * (lr_start - lr_end) * (1.0 + math.cos(math.pi * progress))
+        nesting_ppo.set_lr(cos_lr)
+        print(f"  Nesting LR: {cos_lr:.6f}")
+
+        # ── Nesting 训练：启用联合终局奖励 ──
         nest_env.set_scheduling_partner(sched_model)
+        # 关键：注入 sched_env 和 sched_model，使终局奖励用真实调度
+        nest_env.set_scheduling_for_reward(sched_env, sched_model)
         nesting_ppo.learn(steps, save_path=save_dir, tag=f"nesting_joint_c{c+1}")
 
-        # Scheduling：接收更新后的 nesting predictor
+        # ── Scheduling 训练 ──
         predictor = NestingModelPredictor(nesting_ppo, nest_env)
         sched_env.set_nesting_partner(ActionMasker(nest_env, mask_fn), predictor)
         sched_model.learn(steps, reset_num_timesteps=False)
         sched_model.save(f"{save_dir}/scheduling_joint_c{c+1}")
 
+    # 保存最终模型
+    torch.save(nesting_model.state_dict(), f"{save_dir}/nesting_final.pt")
+    sched_model.save(f"{save_dir}/scheduling_final")
     print("\nTraining complete.")
 
 

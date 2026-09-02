@@ -1,5 +1,15 @@
 """
 手动加载 Scheduling Policy 权重，绕开 MaskablePPO.load() 在 Windows 上的崩溃问题。
+
+修复：
+  - mlp_pi / mlp_vf 前导 nn.Tanh() 与 SB3 保存的权重 key 不匹配
+    SB3 MlpPolicy(activation_fn=Tanh, net_arch=[256,256]) 生成的结构是：
+      policy_net.0 = Linear(256→256)
+      policy_net.1 = Tanh()
+      policy_net.2 = Linear(256→256)
+      policy_net.3 = Tanh()
+    原代码以 Tanh() 开头，导致 key 0→Tanh (无参数), 1→Linear 被映射到 sd 的 0→Linear 权重
+    load_state_dict(strict=False) 静默跳过不匹配的 key，导致推理行为随机。
 """
 import zipfile, io, torch, torch.nn as nn
 import numpy as np
@@ -27,14 +37,14 @@ class SchedulingPolicyInference:
             global_prefix_dim=14,
         ).to(device)
 
-        # mlp_extractor: pi=[256,256], vf=[256,256]
+        # 修复：MLP 结构与 SB3 MlpPolicy(activation_fn=Tanh, net_arch=[256,256]) 对齐
+        # SB3 生成的 Sequential 是: Linear→Tanh→Linear→Tanh
+        # key 映射: 0.weight/bias → Linear, 1 → Tanh(无参数), 2.weight/bias → Linear, 3 → Tanh
         self.mlp_pi = nn.Sequential(
-            nn.Tanh(),
             nn.Linear(256, 256), nn.Tanh(),
             nn.Linear(256, 256), nn.Tanh(),
         ).to(device)
         self.mlp_vf = nn.Sequential(
-            nn.Tanh(),
             nn.Linear(256, 256), nn.Tanh(),
             nn.Linear(256, 256), nn.Tanh(),
         ).to(device)
@@ -51,9 +61,12 @@ class SchedulingPolicyInference:
         self.value_net.eval()
 
     def _load_weights(self, zip_path: str):
-        with zipfile.ZipFile(zip_path + ".zip", 'r') as zf:
+        # 兼容有无 .zip 后缀
+        actual_path = zip_path if zip_path.endswith(".zip") else zip_path + ".zip"
+        with zipfile.ZipFile(actual_path, 'r') as zf:
             with zf.open("policy.pth") as f:
-                sd = torch.load(io.BytesIO(f.read()), map_location=self.device)
+                sd = torch.load(io.BytesIO(f.read()), map_location=self.device,
+                                weights_only=False)
 
         # SB3 保存的 key 前缀映射
         fe_sd  = {k.replace("features_extractor.", ""): v
@@ -68,8 +81,9 @@ class SchedulingPolicyInference:
                   for k, v in sd.items() if k.startswith("value_net.")}
 
         self.features_extractor.load_state_dict(fe_sd, strict=True)
-        if pi_sd:  self.mlp_pi.load_state_dict(pi_sd,   strict=False)
-        if vf_sd:  self.mlp_vf.load_state_dict(vf_sd,   strict=False)
+        # 修复：改为 strict=True，确保权重完全对齐，防止静默错误
+        if pi_sd:  self.mlp_pi.load_state_dict(pi_sd,   strict=True)
+        if vf_sd:  self.mlp_vf.load_state_dict(vf_sd,   strict=True)
         if act_sd: self.action_net.load_state_dict(act_sd, strict=True)
         if val_sd: self.value_net.load_state_dict(val_sd,  strict=True)
         print(f"  [SchedulingPolicy] 权重加载完成，共 {len(sd)} 个 key")

@@ -1,3 +1,12 @@
+"""
+models/pointer_policy.py  —  基于 NestingModel 的 SB3 兼容策略
+
+修复：
+  - 原代码导入不存在的 PointerFeatureExtractor → 改为使用 PartEncoder + StepDecoder
+  - 保留 SB3 MaskableActorCriticPolicy 接口兼容性
+  - 保留 get_attention_weights 可视化接口
+"""
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -5,10 +14,59 @@ from typing import Tuple, Optional
 from sb3_contrib.common.maskable.policies import MaskableActorCriticPolicy
 from sb3_contrib.common.maskable.distributions import MaskableCategoricalDistribution
 from stable_baselines3.common.type_aliases import Schedule
-from models.pointer_extractor import PointerFeatureExtractor, PointerActorHead
+from models.pointer_extractor import PartEncoder, StepDecoder, PointerActorHead
 
-# apply_masking 里 True=合法、False=非法（sb3_contrib 的约定）
 _NEG_INF = -1e9
+
+
+class PointerFeatureExtractor(nn.Module):
+    """
+    将展平 obs 解析为 (tokens, context) 的桥接层。
+    obs 结构: [part_feats_flat(N*part_feat_dim), state_feat(state_feat_dim)]
+    """
+
+    def __init__(self, observation_space, features_dim=128,
+                 item_dim=5, global_prefix_dim=0,
+                 embed_dim=128, n_heads=4, n_layers=2,
+                 max_parts=120, state_feat_dim=57):
+        super().__init__()
+        self.item_dim = item_dim
+        self.max_parts = max_parts
+        self.state_feat_dim = state_feat_dim
+        self.embed_dim = embed_dim
+
+        self.part_encoder = PartEncoder(
+            part_feat_dim=item_dim, embed_dim=embed_dim,
+            n_heads=n_heads, n_layers=n_layers
+        )
+        self.step_decoder = StepDecoder(
+            state_feat_dim=state_feat_dim, embed_dim=embed_dim,
+            n_heads=n_heads
+        )
+        # features_dim 用于 SB3 兼容
+        self._features_dim = features_dim
+
+    @property
+    def features_dim(self):
+        return self._features_dim
+
+    def _get_tokens_and_context(self, obs: torch.Tensor):
+        """
+        解析展平 obs → tokens [B, N, D], context [B, D]
+        """
+        B = obs.shape[0]
+        part_flat_dim = self.max_parts * self.item_dim
+
+        part_feats = obs[:, :part_flat_dim].view(B, self.max_parts, self.item_dim)
+        state_feat = obs[:, part_flat_dim:part_flat_dim + self.state_feat_dim]
+
+        H = self.part_encoder(part_feats)                 # [B, N, D]
+        context, _ = self.step_decoder(state_feat, H)     # [B, D]
+        return H, context
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        _, context = self._get_tokens_and_context(obs)
+        return context
 
 
 class PointerActorCriticPolicy(MaskableActorCriticPolicy):
@@ -23,13 +81,14 @@ class PointerActorCriticPolicy(MaskableActorCriticPolicy):
         observation_space,
         action_space,
         lr_schedule: Schedule,
-        item_dim: int = 67,
+        item_dim: int = 5,
         global_prefix_dim: int = 0,
         embed_dim: int = 128,
         n_heads: int = 4,
         n_layers: int = 2,
         n_parts: int = 120,
         n_actions_per_part: int = 6,
+        state_feat_dim: int = 57,
         **kwargs
     ):
         self.item_dim = item_dim
@@ -39,6 +98,7 @@ class PointerActorCriticPolicy(MaskableActorCriticPolicy):
         self.n_layers = n_layers
         self.n_parts = n_parts
         self.n_actions_per_part = n_actions_per_part
+        self.state_feat_dim = state_feat_dim
 
         super().__init__(observation_space, action_space, lr_schedule, **kwargs)
 
@@ -51,11 +111,12 @@ class PointerActorCriticPolicy(MaskableActorCriticPolicy):
             embed_dim=self.embed_dim,
             n_heads=self.n_heads,
             n_layers=self.n_layers,
+            max_parts=self.n_parts,
+            state_feat_dim=self.state_feat_dim,
         )
 
         self.pointer_head = PointerActorHead(
             embed_dim=self.embed_dim,
-            n_parts=self.n_parts,
             n_actions_per_part=self.n_actions_per_part,
         )
 
@@ -89,17 +150,15 @@ class PointerActorCriticPolicy(MaskableActorCriticPolicy):
         else:
             mask_tensor = action_masks.to(dtype=torch.bool, device=logits.device)
 
-        # 处理 batch 维度
         if mask_tensor.dim() == 1:
             mask_tensor = mask_tensor.unsqueeze(0).expand_as(logits)
         elif mask_tensor.dim() == 2 and mask_tensor.shape[0] != logits.shape[0]:
             mask_tensor = mask_tensor.expand_as(logits)
 
-        # 安全检查：如果某行全是 False，放开所有动作（避免 softmax nan）
-        all_masked = ~mask_tensor.any(dim=-1, keepdim=True)  # [B, 1]
+        # 安全兜底：全 False 时放开所有
+        all_masked = ~mask_tensor.any(dim=-1, keepdim=True)
         mask_tensor = mask_tensor | all_masked.expand_as(mask_tensor)
 
-        # False 位置填充极小值
         logits = logits.masked_fill(~mask_tensor, _NEG_INF)
         return logits
 

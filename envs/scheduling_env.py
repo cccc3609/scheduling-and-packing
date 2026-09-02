@@ -9,6 +9,11 @@ envs/scheduling_env.py
   5. reset() 末尾多余的 obs 拼接块 → 删除
   6. step() 中 import numpy as _np → 改用顶层 np
   7. pk_sched item_dim 不匹配 → scheduling obs 是任务序列，item_dim=4，global_prefix=14
+
+新增修复：
+  8. 非法动作惩罚 -10 → -2，避免 value head 初期发散
+  9. 增加负载均衡步奖励信号
+  10. nesting rollout 使用 predictor.reset_cache() 避免重复编码
 """
 
 import gymnasium as gym
@@ -100,15 +105,19 @@ class SchedulingEnv(gym.Env):
                 total_all_area += area
             self.baseline_cost = max(1.0, total_all_area * self.COST_TARD * 100.0)
 
-            # 修复1：intent 生成在 rollout 开始前，变量名用 real.parts_pool / real.CUTTING_SPEED
+            # intent 生成在 rollout 开始前
             intent_vec = self.intent_encoder.encode_orders(
                 self.orders_snapshot,
-                real.parts_pool,        # 原代码：list_of_parts（未定义）
+                real.parts_pool,
                 self.num_machines,
-                real.CUTTING_SPEED      # 原代码：cutting_speed（未定义）
+                real.CUTTING_SPEED
             )
             if hasattr(real, 'set_scheduling_intent'):
                 real.set_scheduling_intent(intent_vec)
+
+            # 修复：通知 predictor 清空 H 缓存（如果支持）
+            if hasattr(self.nesting_model, 'reset_cache'):
+                self.nesting_model.reset_cache()
 
             # ── nesting rollout ──
             done = False
@@ -120,7 +129,7 @@ class SchedulingEnv(gym.Env):
                 a, _ = self.nesting_model.predict(obs, action_masks=m, deterministic=True)
                 obs, _, done, _, _ = self.nesting_env.step(a)
 
-            # 修复2：在 rollout 完成后读取排样摘要（real 在 if 分支内，有效）
+            # rollout 完成后读取排样摘要
             if hasattr(real, 'nesting_result_vec'):
                 self.nesting_result_vec = real.nesting_result_vec.copy()
 
@@ -128,6 +137,8 @@ class SchedulingEnv(gym.Env):
             for i, plate in enumerate(real.history_plates):
                 if i >= self.max_tasks:
                     break
+                if not plate.placed_parts:
+                    continue
                 cut  = sum(2*(p[2]+p[3]) for p in plate.placed_parts) / speed
                 oids = list(set(int(p[4]) for p in plate.placed_parts))
                 val  = sum(p[2]*p[3] for p in plate.placed_parts)
@@ -137,7 +148,6 @@ class SchedulingEnv(gym.Env):
                 self.task_pool.append({'cut': cut, 'due': due, 'oids': oids, 'val': val})
         else:
             self.task_pool = [{'cut': 10, 'due': 100, 'oids': [], 'val': 100}]
-            # else 分支里 real 不存在，nesting_result_vec 已在方法开头清零
 
         return self._get_obs(), {"action_mask": self._get_action_mask()}
 
@@ -177,8 +187,9 @@ class SchedulingEnv(gym.Env):
         action = int(action)
         t_idx, m_idx = action // self.num_machines, action % self.num_machines
 
+        # 修复：非法动作惩罚从 -10 降为 -2
         if t_idx >= len(self.task_pool) or self.scheduled_mask[t_idx]:
-            return self._get_obs(), -10.0, True, False, {}
+            return self._get_obs(), -2.0, True, False, {}
 
         task = self.task_pool[t_idx]
         curr = self.machine_times[m_idx]
@@ -197,7 +208,15 @@ class SchedulingEnv(gym.Env):
                 self.orders_snapshot[oid]['finished_time'] = max(
                     self.orders_snapshot[oid]['finished_time'], end)
 
-        reward = -float(np.std(self.machine_times)) * 0.01
+        # ── 步奖励：负载均衡 + 交期感知 ──
+        scale = max(10.0, self.episode_time_scale)
+        # 1) 机器负载均衡：std 越小越好
+        reward = -float(np.std(self.machine_times)) / scale * 0.5
+
+        # 2) 选择最空闲机器的奖励（鼓励负载均衡）
+        if m_idx == int(np.argmin(self.machine_times)):
+            reward += 0.1
+
         valid  = len(self.task_pool)
         done   = bool(np.sum(self.scheduled_mask[:valid]) == valid)
 
