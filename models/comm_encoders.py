@@ -13,89 +13,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 import copy
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 全局成本函数：两个 agent 共享的终局评价标准
-# ─────────────────────────────────────────────────────────────────────────────
-
-class GlobalCostFunction:
-    """
-    统一成本计算。Nesting 和 Scheduling 的终局奖励都从这里派生，
-    确保两个 agent 优化同一个目标函数。
-
-    总成本 = 材料成本 + JIT 成本(提前/延迟)
-
-    核心原则：
-    - 这个类只负责"算分"，不负责"给奖励"
-    - 两个 agent 看到的终局成本来自同一次计算，消除评价标准的分歧
-    """
-
-    def __init__(self, cost_mat=0.05, cost_hold=0.0005, cost_tard=0.002,
-                 cutting_speed=10.0):
-        self.cost_mat = cost_mat
-        self.cost_hold = cost_hold
-        self.cost_tard = cost_tard
-        self.cutting_speed = cutting_speed
-
-    def compute(self, plates, orders, parts_pool, plate_w, plate_h,
-                order_finish_times):
-        """
-        统一计算总成本。
-
-        参数:
-            plates: 排样后的板材列表
-            orders: 订单字典 {oid: {'due_date': ...}}
-            parts_pool: 零件列表
-            plate_w, plate_h: 板材尺寸
-            order_finish_times: {oid: finish_time}
-                                 来自真实调度 rollout 或 EDD 模拟
-
-        返回:
-            cost_dict: 包含各项成本和评价指标的字典
-        """
-        final_plates = [p for p in plates if len(p.placed_parts) > 0]
-        total_part_area = sum(p['area'] for p in parts_pool)
-        consumed_area = len(final_plates) * (plate_w * plate_h)
-        utilization = total_part_area / consumed_area if consumed_area > 0 else 0.001
-
-        # 材料成本
-        cost_material = max(0.0, consumed_area - total_part_area) * self.cost_mat
-
-        # JIT 成本
-        cost_jit = 0.0
-        total_delay = 0.0
-        late_count = 0
-        for oid, fin in order_finish_times.items():
-            if oid not in orders:
-                continue
-            due = orders[oid]['due_date']
-            ops = [p for p in parts_pool if p['order_id'] == oid]
-            val = sum(p['area'] for p in ops)
-            proc = max(1.0, sum(2 * (p['w'] + p['h']) for p in ops) / self.cutting_speed)
-            diff = fin - due
-            ratio = abs(diff) / proc
-            coef = 0.0 if ratio <= 0.025 else min(1.0, (ratio - 0.025) / 0.05)
-            if diff > 0:
-                cost_jit += val * self.cost_tard * coef * abs(diff)
-                total_delay += diff
-                late_count += 1
-            else:
-                cost_jit += val * self.cost_hold * coef * abs(diff)
-
-        total_cost = cost_material + cost_jit
-        intrinsic = max(1.0, total_part_area * self.cost_mat)
-
-        return {
-            'cost_material': cost_material,
-            'cost_jit': cost_jit,
-            'cost_total': total_cost,
-            'utilization': utilization,
-            'plate_count': len(final_plates),
-            'total_delay': total_delay,
-            'late_count': late_count,
-            'penalty_ratio': total_cost / intrinsic,
-        }
+from core.cost import GlobalCostFunction
+from core.processing import parts_cutting_time, plate_processing_time
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -171,12 +90,12 @@ class JointRewardCalculator:
             old_orders = copy.deepcopy(sched_env_unwrapped.orders_snapshot)
 
             # 直接构造 task pool（不需要再次 nesting rollout）
-            speed = max(0.1, self.global_cost_fn.cutting_speed)
             task_pool = []
             for plate in plates:
                 if not plate.placed_parts:
                     continue
-                cut = sum(2 * (p[2] + p[3]) for p in plate.placed_parts) / speed
+                cut = plate_processing_time(
+                    plate.placed_parts, self.global_cost_fn.cutting_speed)
                 oids = list(set(int(p[4]) for p in plate.placed_parts))
                 val = sum(p[2] * p[3] for p in plate.placed_parts)
                 due = min((orders[o]['due_date'] for o in oids if o in orders),
@@ -195,7 +114,7 @@ class JointRewardCalculator:
                     ops = [p for p in parts_pool if p['order_id'] == oid]
                     sched_env_unwrapped.orders_snapshot[oid]['total_area'] = sum(p['area'] for p in ops)
                     sched_env_unwrapped.orders_snapshot[oid]['proc_time'] = max(
-                        1.0, sum(2 * (p['w'] + p['h']) for p in ops) / speed)
+                        1.0, parts_cutting_time(ops, self.global_cost_fn.cutting_speed))
 
             obs = sched_env_unwrapped._get_obs()
             mask = sched_env_unwrapped._get_action_mask()
@@ -233,7 +152,6 @@ class JointRewardCalculator:
 
     def _compute_with_edd(self, plates, orders, parts_pool, plate_w, plate_h):
         """EDD 贪心模拟 fallback"""
-        cutting_speed = self.global_cost_fn.cutting_speed
         local = {oid: {'due_date': v['due_date'], 'finished_time': 0.0}
                  for oid, v in orders.items()}
 
@@ -241,7 +159,8 @@ class JointRewardCalculator:
         for plate in plates:
             if not plate.placed_parts:
                 continue
-            cut = sum(2 * (p[2] + p[3]) for p in plate.placed_parts) / cutting_speed
+            cut = plate_processing_time(
+                plate.placed_parts, self.global_cost_fn.cutting_speed)
             oids = list(set(int(p[4]) for p in plate.placed_parts))
             due = min((local[o]['due_date'] for o in oids if o in local), default=999.0)
             tasks.append({'cut': cut, 'due': due, 'oids': oids})

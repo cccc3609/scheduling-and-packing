@@ -22,8 +22,11 @@ from gymnasium import spaces
 from heuristic.blf_skyline_maxrects import PlateLayoutManager
 from heuristic.scheduler import SchedulerStateMachine
 from config import MAX_PARTS_CAPACITY, TRAIN_CONFIG, MAX_SCHED_TASKS_CAPACITY, COST_CONFIG, FEATURE_CONFIG
+from core.cost import GlobalCostFunction
+from core.instance import ProductionInstance, generate_instance
+from core.processing import parts_cutting_time, plate_processing_time
 from models.comm_encoders import (
-    NestingResultEncoder, GlobalCostFunction, JointRewardCalculator
+    NestingResultEncoder, JointRewardCalculator
 )
 
 
@@ -121,23 +124,32 @@ class NestingSchedulingEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        if options and 'num_parts' in options:
+        options = options or {}
+        supplied_instance = options.get('instance')
+        if supplied_instance is not None:
+            if not isinstance(supplied_instance, ProductionInstance):
+                raise TypeError("options['instance'] must be a ProductionInstance")
+            if len(supplied_instance.parts) > self.max_capacity:
+                raise ValueError("ProductionInstance exceeds max part capacity")
+            self.current_num_parts = len(supplied_instance.parts)
+            self.plate_w, self.plate_h = supplied_instance.plate_w, supplied_instance.plate_h
+            self.parts_pool = copy.deepcopy(supplied_instance.parts)
+            self.orders = copy.deepcopy(supplied_instance.orders)
+        elif 'num_parts' in options:
             self.current_num_parts = options['num_parts']
         else:
             lo, hi = TRAIN_CONFIG['min_parts'], TRAIN_CONFIG['max_parts']
-            self.current_num_parts = np.random.randint(lo, hi + 1)
+            self.current_num_parts = int(self.np_random.integers(lo, hi + 1))
         self.current_num_parts = min(self.current_num_parts, self.max_capacity)
-
-        if options and 'plate_size' in options:
-            self.plate_w, self.plate_h = options['plate_size']
-        else:
-            lo, hi = TRAIN_CONFIG['min_plate_dim'], TRAIN_CONFIG['max_plate_dim']
-            self.plate_w = np.random.randint(lo, hi + 1)
-            self.plate_h = np.random.randint(lo, hi + 1)
-
-        self.parts_pool, self.orders = self._generate_random_orders()
-        total_perim = sum(2 * (p['w'] + p['h']) for p in self.parts_pool)
-        self.episode_time_scale = max(10.0, total_perim / self.CUTTING_SPEED)
+        if supplied_instance is None:
+            if 'plate_size' in options:
+                self.plate_w, self.plate_h = options['plate_size']
+            else:
+                lo, hi = TRAIN_CONFIG['min_plate_dim'], TRAIN_CONFIG['max_plate_dim']
+                self.plate_w = int(self.np_random.integers(lo, hi + 1))
+                self.plate_h = int(self.np_random.integers(lo, hi + 1))
+            self.parts_pool, self.orders = self._generate_random_orders(seed=seed)
+        self.episode_time_scale = max(10.0, parts_cutting_time(self.parts_pool, self.CUTTING_SPEED))
 
         self.packed_indices  = set()
         self.scheduler_state_machine.reset()
@@ -226,7 +238,7 @@ class NestingSchedulingEnv(gym.Env):
                 frag.append(1.0 - oids.count(oid) / max(1, tot))
             if frag:
                 order_frag_idx = float(np.mean(frag))
-            cut_t = sum(2*(p[2]+p[3]) for p in lp.placed_parts) / max(0.1, self.CUTTING_SPEED)
+            cut_t = plate_processing_time(lp.placed_parts, self.CUTTING_SPEED)
             if dues:
                 proj_tardiness = max(0.0, (curr_time + cut_t - min(dues)) / safe_scale)
         if len(mach_times) > 0:
@@ -347,37 +359,16 @@ class NestingSchedulingEnv(gym.Env):
 
     # ── 数据生成 ─────────────────────────────────────────────────────────────
 
-    def _generate_random_orders(self):
-        data, orders = [], {}
-        cnt, oid = 0, 0
-        avg_perim    = 2 * (0.25 * self.plate_w + 0.25 * self.plate_h)
-        est_makespan = (self.current_num_parts * avg_perim / max(0.1, self.CUTTING_SPEED) / 3) * 1.3
-
-        while cnt < self.current_num_parts:
-            batch = np.random.randint(1, 16)
-            if cnt + batch > self.current_num_parts:
-                batch = self.current_num_parts - cnt
-            temp, order_p = [], 0
-            for _ in range(batch):
-                w_ratio = np.random.beta(a=2, b=5) * 0.9 + 0.05
-                h_ratio = np.random.beta(a=2, b=5) * 0.9 + 0.05
-                if np.random.rand() > 0.5:
-                    w_ratio, h_ratio = h_ratio, w_ratio
-                w = max(1, int(w_ratio * self.plate_w))
-                h = max(1, int(h_ratio * self.plate_h))
-                order_p += 2 * (w + h)
-                temp.append({'w': w, 'h': h, 'area': w * h})
-            self_time   = order_p / max(0.1, self.CUTTING_SPEED)
-            buffer_time = (np.random.poisson(lam=2.0) + 0.1) * (est_makespan / 2.0)
-            final_due   = self_time + buffer_time
-            orders[oid] = {'due_date': final_due, 'finished_time': 0.0}
-            for p in temp:
-                data.append({'w': p['w'], 'h': p['h'], 'area': p['area'],
-                             'due_date': final_due, 'order_id': oid, 'original_idx': cnt})
-                cnt += 1
-            oid += 1
-        np.random.shuffle(data)
-        return data, orders
+    def _generate_random_orders(self, seed=None):
+        instance = generate_instance(
+            seed=seed,
+            num_parts=self.current_num_parts,
+            plate_size=(self.plate_w, self.plate_h),
+            num_machines=self.scheduler_state_machine.num_machines,
+            cutting_speed=self.CUTTING_SPEED,
+            rng=self.np_random,
+        )
+        return instance.parts, instance.orders
 
     def _compute_metrics(self):
         m = self.cost_metrics.copy()

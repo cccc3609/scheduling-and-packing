@@ -14,13 +14,12 @@ class SchedulerStateMachine:
         self.machines_avail_time = np.zeros(self.num_machines)
         self.log = []
 
-    def execute_assignment(self, machine_idx, cut_path_length, plate_idx):
+    def execute_assignment(self, machine_idx, processing_time, plate_idx):
         """
         执行 Agent 下达的指令
         """
         start_time = self.machines_avail_time[machine_idx]
-        processing_time = cut_path_length + 0.1
-        end_time = start_time + processing_time
+        end_time = start_time + float(processing_time)
 
         # 更新机器状态
         self.machines_avail_time[machine_idx] = end_time

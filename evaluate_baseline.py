@@ -9,7 +9,9 @@ from tqdm import tqdm
 from envs.packing_envs import NestingSchedulingEnv
 from heuristic.blf_skyline_maxrects import PlateLayoutManager
 from heuristic.scheduler import SchedulerStateMachine
-from config import TEST_SCENARIOS, COST_CONFIG
+from config import TEST_SCENARIOS
+from core.cost import GlobalCostFunction
+from core.processing import plate_processing_time
 
 
 def run_heuristic_baseline():
@@ -83,10 +85,8 @@ def run_heuristic_baseline():
             # ==========================================
             scheduler = SchedulerStateMachine(num_machines=3)
             tasks = []
-            speed = COST_CONFIG['cutting_speed']
-
             for idx, plate in enumerate(final_plates):
-                cut_time = sum([2 * (p[2] + p[3]) for p in plate.placed_parts]) / speed
+                cut_time = plate_processing_time(plate.placed_parts)
                 oids = list(set([int(p[4]) for p in plate.placed_parts]))
                 min_due = min([orders[o]['due_date'] for o in oids]) if oids else 999.0
                 tasks.append({'cut': cut_time, 'due': min_due, 'idx': idx, 'oids': oids, 'done': False})
@@ -108,48 +108,17 @@ def run_heuristic_baseline():
             consumed_area = len(final_plates) * (plate_w * plate_h)
             utilization = total_part_area / consumed_area if consumed_area > 0 else 0.001
 
-            # 浪费的面积罚款
-            wasted_area = max(0.0, consumed_area - total_part_area)
-            cost_material = wasted_area * COST_CONFIG['cost_material']
-
-            cost_jit = 0.0
-            late_count = 0
-
-            for oid, order in orders.items():
-                due = order['due_date']
-                fin = order['finished_time']
-                order_parts = [p for p in parts_pool if p['order_id'] == oid]
-                order_value = sum([p['area'] for p in order_parts])
-                order_proc_time = max(1.0, sum([2 * (p['w'] + p['h']) for p in order_parts]) / speed)
-
-                diff = fin - due
-                abs_diff = abs(diff)
-
-                if diff > 0: late_count += 1
-
-                ratio = abs_diff / order_proc_time
-                R_FREE, R_FULL = 0.025, 0.075
-                if ratio <= R_FREE:
-                    coef = 0.0
-                elif ratio <= R_FULL:
-                    coef = (ratio - R_FREE) / (R_FULL - R_FREE)
-                else:
-                    coef = 1.0
-
-                if diff > 0:
-                    cost_jit += order_value * (COST_CONFIG['cost_tardiness'] * coef) * abs_diff
-                else:
-                    cost_jit += order_value * (COST_CONFIG['cost_earliness'] * coef) * abs_diff
-
-            # 纯罚款总和
-            total_cost = cost_material + cost_jit
+            cost = GlobalCostFunction().compute(
+                final_plates, orders, parts_pool, plate_w, plate_h,
+                {oid: order['finished_time'] for oid, order in orders.items()},
+            )
 
             # 收集该局数据
             metrics["utilization"].append(utilization)
-            metrics["total_cost"].append(total_cost)
-            metrics["mat_cost"].append(cost_material)
-            metrics["jit_cost"].append(cost_jit)
-            metrics["late_rate"].append(late_count / len(orders) if orders else 0)
+            metrics["total_cost"].append(cost['cost_total'])
+            metrics["mat_cost"].append(cost['cost_material'])
+            metrics["jit_cost"].append(cost['cost_jit'])
+            metrics["late_rate"].append(cost['late_count'] / len(orders) if orders else 0)
             metrics["plate_count"].append(len(final_plates))
 
         # 汇总该场景数据

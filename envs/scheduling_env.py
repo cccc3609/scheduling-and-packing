@@ -21,6 +21,8 @@ import numpy as np
 from gymnasium import spaces
 import copy
 from config import MAX_SCHED_TASKS_CAPACITY, COST_CONFIG, TRAIN_CONFIG
+from core.cost import GlobalCostFunction
+from core.processing import parts_cutting_time, plate_processing_time
 from models.comm_encoders import SchedulingIntentEncoder
 
 
@@ -36,6 +38,10 @@ class SchedulingEnv(gym.Env):
 
         self.COST_HOLD = COST_CONFIG['cost_earliness']
         self.COST_TARD = COST_CONFIG['cost_tardiness']
+        self.global_cost_fn = GlobalCostFunction(
+            cost_hold=self.COST_HOLD,
+            cost_tard=self.COST_TARD,
+        )
 
         self.episode_time_scale = 100.0
         self.baseline_cost = 1.0
@@ -97,10 +103,9 @@ class SchedulingEnv(gym.Env):
             for oid in self.orders_snapshot:
                 parts = [p for p in real.parts_pool if p['order_id'] == oid]
                 area  = sum(p['area'] for p in parts)
-                speed = max(0.1, real.CUTTING_SPEED)
                 self.orders_snapshot[oid]['total_area'] = area
                 self.orders_snapshot[oid]['proc_time']  = max(
-                    1.0, sum(2*(p['w']+p['h']) for p in parts) / speed)
+                    1.0, parts_cutting_time(parts, real.CUTTING_SPEED))
                 self.orders_snapshot[oid]['finished_time'] = 0.0
                 total_all_area += area
             self.baseline_cost = max(1.0, total_all_area * self.COST_TARD * 100.0)
@@ -133,13 +138,12 @@ class SchedulingEnv(gym.Env):
             if hasattr(real, 'nesting_result_vec'):
                 self.nesting_result_vec = real.nesting_result_vec.copy()
 
-            speed = max(0.1, real.CUTTING_SPEED)
             for i, plate in enumerate(real.history_plates):
                 if i >= self.max_tasks:
                     break
                 if not plate.placed_parts:
                     continue
-                cut  = sum(2*(p[2]+p[3]) for p in plate.placed_parts) / speed
+                cut  = plate_processing_time(plate.placed_parts, real.CUTTING_SPEED)
                 oids = list(set(int(p[4]) for p in plate.placed_parts))
                 val  = sum(p[2]*p[3] for p in plate.placed_parts)
                 due  = min((self.orders_snapshot[o]['due_date']
@@ -163,8 +167,7 @@ class SchedulingEnv(gym.Env):
                    if i not in real_nest.packed_indices]
             if rem:
                 rp    = [real_nest.parts_pool[i] for i in rem]
-                spd   = max(0.1, real_nest.CUTTING_SPEED)
-                upstream_workload  = (sum(2*(p['w']+p['h']) for p in rp) / spd) / (self.num_machines * scale)
+                upstream_workload  = parts_cutting_time(rp, real_nest.CUTTING_SPEED) / (self.num_machines * scale)
                 upstream_urgent_due = (min(p['due_date'] for p in rp) - min_t) / scale
                 giant = sum(1 for p in rp if p['area'] > (real_nest.plate_w * real_nest.plate_h) / 4.0)
                 upstream_giant_ratio = giant / len(rp)
@@ -221,13 +224,11 @@ class SchedulingEnv(gym.Env):
         done   = bool(np.sum(self.scheduled_mask[:valid]) == valid)
 
         if done:
-            jit_cost = 0.0
-            for oid, order in self.orders_snapshot.items():
-                diff  = order['finished_time'] - order['due_date']
-                ratio = abs(diff) / order.get('proc_time', 1.0)
-                coef  = 0.0 if ratio <= 0.025 else min(1.0, (ratio - 0.025) / 0.05)
-                rate  = self.COST_TARD if diff > 0 else self.COST_HOLD
-                jit_cost += order.get('total_area', 1.0) * (rate * coef) * abs(diff)
+            jit_cost = sum(
+                self.global_cost_fn.order_jit_cost(
+                    oid, order['finished_time'], self.orders_snapshot)
+                for oid, order in self.orders_snapshot.items()
+            )
             reward += float(np.clip(-(jit_cost / self.baseline_cost) * 10.0, -20.0, 20.0))
 
         return self._get_obs(), reward, done, False, {}

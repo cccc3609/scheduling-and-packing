@@ -12,6 +12,8 @@ NUM_MACHINES = 3
 # 假设单位：距离=cm, 时间=min, 货币=元
 COST_CONFIG = {
     "cutting_speed": 10.0,
+    # 每张投入加工的板材均需一次固定装夹/准备时间（min）
+    "plate_setup_time": 0.1,
 
     # [材料成本]
     # 普通钢板约 0.05元/cm² (200x200板材约 2000元)

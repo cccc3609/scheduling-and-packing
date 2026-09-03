@@ -15,7 +15,9 @@ from envs.packing_envs import NestingSchedulingEnv
 from models.pointer_extractor import NestingModel
 from heuristic.blf_skyline_maxrects import PlateLayoutManager
 from heuristic.scheduler import SchedulerStateMachine
-from config import TEST_SCENARIOS, COST_CONFIG, MAX_PARTS_CAPACITY
+from config import TEST_SCENARIOS, MAX_PARTS_CAPACITY
+from core.cost import GlobalCostFunction
+from core.processing import plate_processing_time
 
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial']
 plt.rcParams['axes.unicode_minus'] = False
@@ -154,8 +156,6 @@ def run_baseline_episode(
     for o in orders.values():
         o['finished_time'] = 0.0
 
-    speed = COST_CONFIG['cutting_speed']
-
     # FFD
     sorted_parts  = sorted(parts_pool, key=lambda x: x['area'], reverse=True)
     active_plates = [PlateLayoutManager(width=plate_w, height=plate_h)]
@@ -177,7 +177,7 @@ def run_baseline_episode(
     scheduler = SchedulerStateMachine(num_machines=3)
     tasks = []
     for idx, plate in enumerate(final_plates):
-        cut  = sum(2*(p[2]+p[3]) for p in plate.placed_parts) / speed
+        cut  = plate_processing_time(plate.placed_parts)
         oids = list(set(int(p[4]) for p in plate.placed_parts))
         due  = min((orders[o]['due_date'] for o in oids if o in orders), default=999.0)
         tasks.append({'cut': cut, 'due': due, 'idx': idx, 'oids': oids})
@@ -193,28 +193,18 @@ def run_baseline_episode(
     total_area  = sum(p['area'] for p in parts_pool)
     consumed    = len(final_plates) * plate_w * plate_h
     util        = total_area / consumed if consumed > 0 else 0.001
-    cost_mat    = max(0.0, consumed - total_area) * COST_CONFIG['cost_material']
-    cost_jit    = 0.0
-    late_cnt    = 0
-    for oid, order in orders.items():
-        diff = order['finished_time'] - order['due_date']
-        if diff > 0:
-            late_cnt += 1
-        ops  = [p for p in parts_pool if p['order_id'] == oid]
-        val  = sum(p['area'] for p in ops)
-        proc = max(1.0, sum(2*(p['w']+p['h']) for p in ops) / speed)
-        ratio = abs(diff) / proc
-        coef  = 0.0 if ratio <= 0.025 else min(1.0, (ratio-0.025)/0.05)
-        rate  = COST_CONFIG['cost_tardiness'] if diff > 0 else COST_CONFIG['cost_earliness']
-        cost_jit += val * rate * coef * abs(diff)
+    cost = GlobalCostFunction().compute(
+        final_plates, orders, parts_pool, plate_w, plate_h,
+        {oid: order['finished_time'] for oid, order in orders.items()},
+    )
 
     return {
         'utilization':   util,
-        'cost_total':    cost_mat + cost_jit,
-        'cost_material': cost_mat,
-        'cost_jit':      cost_jit,
+        'cost_total':    cost['cost_total'],
+        'cost_material': cost['cost_material'],
+        'cost_jit':      cost['cost_jit'],
         'plate_count':   len(final_plates),
-        'late_rate':     late_cnt / max(1, len(orders)),
+        'late_rate':     cost['late_count'] / max(1, len(orders)),
     }
 
 
