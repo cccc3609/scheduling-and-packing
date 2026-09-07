@@ -1,35 +1,25 @@
-"""
-envs/scheduling_env.py
-
-修复清单：
-  1. COMM_DIM_IN 先用后定义 → 调整顺序
-  2. reset() 中 list_of_parts / cutting_speed 未定义 → 改为 real.parts_pool / real.CUTTING_SPEED
-  3. intent 生成位置错误（在 rollout 后）→ 移到 rollout 开始前
-  4. hasattr(real,...) 在 else 分支里 real 未定义 → 移入 if 分支
-  5. reset() 末尾多余的 obs 拼接块 → 删除
-  6. step() 中 import numpy as _np → 改用顶层 np
-  7. pk_sched item_dim 不匹配 → scheduling obs 是任务序列，item_dim=4，global_prefix=14
-
-新增修复：
-  8. 非法动作惩罚 -10 → -2，避免 value head 初期发散
-  9. 增加负载均衡步奖励信号
-  10. nesting rollout 使用 predictor.reset_cache() 避免重复编码
-"""
+"""Scheduling environment with an explicit, shared observation contract."""
 
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
-from config import MAX_SCHED_TASKS_CAPACITY, COST_CONFIG, TRAIN_CONFIG
+from config import MAX_SCHED_TASKS_CAPACITY, COST_CONFIG, NUM_MACHINES
 from core.cost import GlobalCostFunction
+from core.scheduling_observation import (
+    SchedulingObservationLayout,
+    SchedulingTaskFeature,
+)
 from core.scheduling_problem import SchedulingProblem
 
 
 class SchedulingEnv(gym.Env):
 
-    def __init__(self, num_machines=3, max_tasks=None):
+    def __init__(self, num_machines=NUM_MACHINES, max_tasks=None):
         super().__init__()
         self.num_machines = num_machines
         self.max_tasks = max_tasks if max_tasks is not None else MAX_SCHED_TASKS_CAPACITY
+        self.observation_layout = SchedulingObservationLayout(
+            num_machines=self.num_machines, max_tasks=self.max_tasks)
 
         self.total_actions = self.max_tasks * num_machines
         self.action_space = spaces.Discrete(self.total_actions)
@@ -50,29 +40,26 @@ class SchedulingEnv(gym.Env):
         self.task_pool = []
         self.machine_times = np.zeros(num_machines)
         self.scheduled_mask = np.zeros(self.max_tasks, dtype=bool)
+        self.valid_task_mask = np.zeros(self.max_tasks, dtype=bool)
         self.orders_snapshot = {}
-
-        _max_dim = TRAIN_CONFIG.get('max_plate_dim', 300)
-        self.val_norm = float(_max_dim * _max_dim)
+        self.order_to_task_indices = {}
 
         # 通信向量（先定义，后使用）
-        self.COMM_DIM_IN  = 8    # 接收排样结果摘要
+        self.COMM_DIM_IN  = self.observation_layout.context_dim
         self.COMM_DIM_OUT = 16   # 输出调度意图向量
         self.nesting_result_vec = np.zeros(self.COMM_DIM_IN, dtype=np.float32)
 
-        # obs 维度：
-        #   global_prefix = machines(3) + upstream(3) + nesting_result(8) = 14
-        #   tasks         = max_tasks × 4
-        # AttentionFeatureExtractor 的 global_prefix_dim=14，item_dim=4
-        dim = num_machines + (self.max_tasks * 4) + 3 + self.COMM_DIM_IN
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(dim,), dtype=np.float32)
+            low=-np.inf, high=np.inf,
+            shape=(self.observation_layout.obs_dim,), dtype=np.float32)
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.machine_times  = np.zeros(self.num_machines)
         self.task_pool      = []
         self.scheduled_mask = np.zeros(self.max_tasks, dtype=bool)
+        self.valid_task_mask = np.zeros(self.max_tasks, dtype=bool)
+        self.order_to_task_indices = {}
         self.episode_time_scale = 100.0
         self.baseline_cost  = 100.0
         self.plate_area     = 40000.0
@@ -85,6 +72,8 @@ class SchedulingEnv(gym.Env):
         if len(problem.tasks) > self.max_tasks:
             raise ValueError(
                 f"SchedulingProblem has {len(problem.tasks)} tasks, exceeds max_tasks={self.max_tasks}")
+        if len(problem.tasks) == 0:
+            raise ValueError("SchedulingEnv requires at least one scheduling task")
         context = np.asarray(options.get("nesting_context", np.zeros(self.COMM_DIM_IN)), dtype=np.float32)
         if context.shape != (self.COMM_DIM_IN,):
             raise ValueError(f"nesting_context must have shape ({self.COMM_DIM_IN},)")
@@ -108,6 +97,18 @@ class SchedulingEnv(gym.Env):
              "oids": list(task.order_ids), "val": task.plate_part_area}
             for task in problem.tasks
         ]
+        self.valid_task_mask[:len(self.task_pool)] = True
+        order_to_tasks = {order_id: [] for order_id in self.orders_snapshot}
+        for task_index, task in enumerate(self.task_pool):
+            for order_id in task["oids"]:
+                if order_id not in order_to_tasks:
+                    raise ValueError(
+                        f"Scheduling task references unknown order_id={order_id}")
+                order_to_tasks[order_id].append(task_index)
+        self.order_to_task_indices = {
+            order_id: tuple(task_indices)
+            for order_id, task_indices in order_to_tasks.items()
+        }
 
         return self._get_obs(), {"action_mask": self._get_action_mask()}
 
@@ -116,28 +117,76 @@ class SchedulingEnv(gym.Env):
         scale = max(10.0, self.episode_time_scale)
         m_feat = (self.machine_times - min_t) / scale
 
-        total_work = sum(task['cut'] for task in self.task_pool)
-        upstream_workload = total_work / max(1.0, self.num_machines * scale)
-        upstream_urgent_due = (
-            min((task['due'] for task in self.task_pool), default=min_t) - min_t
-        ) / scale
-        upstream_giant_ratio = (
-            sum(task['val'] > self.plate_area / 4.0 for task in self.task_pool)
-            / max(1, len(self.task_pool))
-        )
-        upstream_feats = [upstream_workload, upstream_urgent_due, upstream_giant_ratio]
+        unscheduled_indices = [
+            index for index in range(len(self.task_pool))
+            if not self.scheduled_mask[index]
+        ]
+        if unscheduled_indices:
+            unscheduled_tasks = [self.task_pool[index] for index in unscheduled_indices]
+            remaining_workload = sum(task["cut"] for task in unscheduled_tasks)
+            dynamic_globals = np.asarray([
+                remaining_workload / (self.num_machines * scale),
+                (min(task["due"] for task in unscheduled_tasks) - min_t) / scale,
+                sum(task["val"] > self.plate_area / 4.0 for task in unscheduled_tasks)
+                / len(unscheduled_tasks),
+            ], dtype=np.float32)
+        else:
+            dynamic_globals = np.zeros(
+                self.observation_layout.dynamic_global_dim, dtype=np.float32)
 
-        t_feat = []
-        for i in range(self.max_tasks):
-            if i < len(self.task_pool):
-                t = self.task_pool[i]
-                t_feat.extend([t['cut']/scale, (t['due']-min_t)/scale,
-                               1.0 if self.scheduled_mask[i] else 0.0,
-                               t['val'] / self.val_norm])
-            else:
-                t_feat.extend([0.0, 0.0, 1.0, 0.0])
+        remaining_counts = {}
+        remaining_ratios = {}
+        optimistic_slacks = {}
+        for order_id, linked_indices in self.order_to_task_indices.items():
+            remaining_indices = [
+                index for index in linked_indices if not self.scheduled_mask[index]
+            ]
+            remaining_count = len(remaining_indices)
+            remaining_counts[order_id] = remaining_count
+            remaining_ratios[order_id] = (
+                remaining_count / len(linked_indices) if linked_indices else 0.0)
+            remaining_work = sum(
+                self.task_pool[index]["cut"] for index in remaining_indices)
+            order = self.orders_snapshot[order_id]
+            optimistic_finish = max(
+                order["finished_time"],
+                min_t + remaining_work / self.num_machines,
+            )
+            optimistic_slacks[order_id] = order["due_date"] - optimistic_finish
 
-        obs = np.concatenate([m_feat, upstream_feats, t_feat, self.nesting_result_vec]).astype(np.float32)
+        task_tokens = np.zeros(
+            (self.max_tasks, self.observation_layout.task_dim), dtype=np.float32)
+        feature = SchedulingTaskFeature
+        total_orders = max(1, len(self.orders_snapshot))
+        for task_index, task in enumerate(self.task_pool):
+            linked_orders = task["oids"]
+            token = task_tokens[task_index]
+            token[feature.PROCESSING_TIME] = task["cut"] / scale
+            token[feature.RELATIVE_DUE] = (task["due"] - min_t) / scale
+            token[feature.PLATE_AREA_RATIO] = task["val"] / self.plate_area
+            token[feature.LINKED_ORDER_RATIO] = len(linked_orders) / total_orders
+            token[feature.SCHEDULED] = float(self.scheduled_mask[task_index])
+            if linked_orders:
+                ratios = [remaining_ratios[order_id] for order_id in linked_orders]
+                token[feature.MEAN_REMAINING_RATIO] = float(np.mean(ratios))
+                token[feature.MAX_REMAINING_RATIO] = float(np.max(ratios))
+                if not self.scheduled_mask[task_index]:
+                    token[feature.RELEASE_FRACTION] = (
+                        sum(remaining_counts[order_id] == 1 for order_id in linked_orders)
+                        / len(linked_orders)
+                    )
+                token[feature.WORST_SLACK] = (
+                    min(optimistic_slacks[order_id] for order_id in linked_orders)
+                    / scale
+                )
+            token[feature.VALID] = float(self.valid_task_mask[task_index])
+
+        obs = np.concatenate([
+            m_feat,
+            dynamic_globals,
+            self.nesting_result_vec,
+            task_tokens.reshape(-1),
+        ]).astype(np.float32)
         return np.clip(np.nan_to_num(obs, nan=0.0, posinf=5.0, neginf=-5.0), -5.0, 5.0)
 
     def step(self, action):
@@ -188,13 +237,5 @@ class SchedulingEnv(gym.Env):
         return self._get_obs(), reward, done, False, {}
 
     def _get_action_mask(self):
-        valid = len(self.task_pool)
-        if valid == 0 or bool(np.all(self.scheduled_mask[:valid])):
-            return np.ones(self.total_actions, dtype=bool)
-        mask  = np.zeros(self.total_actions, dtype=bool)
-        has_v = False
-        for i in range(valid):
-            if not self.scheduled_mask[i]:
-                mask[i * self.num_machines: (i + 1) * self.num_machines] = True
-                has_v = True
-        return mask if has_v else np.ones(self.total_actions, dtype=bool)
+        selectable_tasks = self.valid_task_mask & ~self.scheduled_mask
+        return np.repeat(selectable_tasks, self.num_machines)

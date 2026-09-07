@@ -14,6 +14,7 @@
 import zipfile, io, torch, torch.nn as nn
 import numpy as np
 from models.attention_extractor import AttentionFeatureExtractor
+from core.scheduling_observation import SchedulingObservationLayout
 from stable_baselines3.common.distributions import CategoricalDistribution
 
 
@@ -23,18 +24,18 @@ class SchedulingPolicyInference:
     行为与 MaskablePPO.predict() 完全一致。
     """
 
-    def __init__(self, zip_path: str, obs_dim: int, action_dim: int,
+    def __init__(self, zip_path: str, layout: SchedulingObservationLayout,
                  device: str = "cpu"):
         self.device     = device
-        self.action_dim = action_dim
+        self.layout = layout
+        self.action_dim = layout.max_tasks * layout.num_machines
 
         # ── 重建 policy 网络结构 ──
         # 与 train_dual.py 的 make_sched_policy_kwargs() 完全对应
         self.features_extractor = AttentionFeatureExtractor(
-            observation_space=_fake_space(obs_dim),
+            observation_space=_fake_space(layout.obs_dim),
             features_dim=256,
-            item_dim=4,
-            global_prefix_dim=14,
+            layout=layout,
         ).to(device)
 
         # 修复：MLP 结构与 SB3 MlpPolicy(activation_fn=Tanh, net_arch=[256,256]) 对齐
@@ -48,7 +49,7 @@ class SchedulingPolicyInference:
             nn.Linear(256, 256), nn.Tanh(),
             nn.Linear(256, 256), nn.Tanh(),
         ).to(device)
-        self.action_net = nn.Linear(256, action_dim).to(device)
+        self.action_net = nn.Linear(256, self.action_dim).to(device)
         self.value_net  = nn.Linear(256, 1).to(device)
 
         # ── 加载权重 ──
@@ -80,7 +81,13 @@ class SchedulingPolicyInference:
         val_sd = {k.replace("value_net.", ""): v
                   for k, v in sd.items() if k.startswith("value_net.")}
 
-        self.features_extractor.load_state_dict(fe_sd, strict=True)
+        try:
+            self.features_extractor.load_state_dict(fe_sd, strict=True)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "Scheduling checkpoint is incompatible with the Patch 3 "
+                "10-D task observation schema; retrain the scheduling policy."
+            ) from exc
         # 修复：改为 strict=True，确保权重完全对齐，防止静默错误
         if pi_sd:  self.mlp_pi.load_state_dict(pi_sd,   strict=True)
         if vf_sd:  self.mlp_vf.load_state_dict(vf_sd,   strict=True)
@@ -132,10 +139,17 @@ def load_scheduling_policy(zip_prefix: str,
                             device: str = "cpu") -> SchedulingPolicyInference:
     """
     对外接口。
-    obs_dim    : scheduling obs 维度 = 3 + 120*4 + 3 + 8 = 494
-    action_dim : 120 * 3 = 360
+    ``obs_dim`` and ``action_dim`` are validation-only compatibility arguments.
+    New checkpoints must match the authoritative scheduling layout exactly.
     """
-    from config import MAX_SCHED_TASKS_CAPACITY
-    if obs_dim    is None: obs_dim    = 3 + MAX_SCHED_TASKS_CAPACITY * 4 + 3 + 8
-    if action_dim is None: action_dim = MAX_SCHED_TASKS_CAPACITY * 3
-    return SchedulingPolicyInference(zip_prefix, obs_dim, action_dim, device)
+    from config import MAX_SCHED_TASKS_CAPACITY, NUM_MACHINES
+    layout = SchedulingObservationLayout(
+        num_machines=NUM_MACHINES, max_tasks=MAX_SCHED_TASKS_CAPACITY)
+    expected_action_dim = layout.max_tasks * layout.num_machines
+    if obs_dim is not None and obs_dim != layout.obs_dim:
+        raise ValueError(
+            f"obs_dim={obs_dim} does not match Patch 3 layout {layout.obs_dim}")
+    if action_dim is not None and action_dim != expected_action_dim:
+        raise ValueError(
+            f"action_dim={action_dim} does not match layout {expected_action_dim}")
+    return SchedulingPolicyInference(zip_prefix, layout, device)

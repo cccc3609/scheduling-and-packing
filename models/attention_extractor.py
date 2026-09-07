@@ -2,26 +2,31 @@ import torch
 import torch.nn as nn
 import gymnasium as gym
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from core.scheduling_observation import SchedulingObservationLayout
 
 
 class AttentionFeatureExtractor(BaseFeaturesExtractor):
-    """
-    升级版特征提取器：
-    使用 Transformer Encoder 处理变长零件序列。
-    具备 Self-Attention 机制，能捕捉零件间的几何互补关系。
-    """
+    """Encode fixed global context and a masked scheduling-task sequence."""
 
-    def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 256,
-                 item_dim: int = 42, global_prefix_dim: int = 0):
+    def __init__(
+        self,
+        observation_space: gym.spaces.Box,
+        features_dim: int = 256,
+        layout: SchedulingObservationLayout = None,
+    ):
         super().__init__(observation_space, features_dim)
+        if not isinstance(layout, SchedulingObservationLayout):
+            raise TypeError("AttentionFeatureExtractor requires SchedulingObservationLayout")
+        if observation_space.shape != (layout.obs_dim,):
+            raise ValueError(
+                "Scheduling observation space does not match layout: "
+                f"expected {(layout.obs_dim,)}, got {observation_space.shape}"
+            )
 
-        self.item_dim = item_dim
-        self.global_prefix_dim = global_prefix_dim
-
-        total_input_dim = observation_space.shape[0]
-        self.seq_input_dim = total_input_dim - global_prefix_dim
-
-        self.max_items = self.seq_input_dim // self.item_dim
+        self.layout = layout
+        self.item_dim = layout.task_dim
+        self.global_prefix_dim = layout.global_prefix_dim
+        self.max_items = layout.max_tasks
         self.embed_dim = 128  # Transformer 的隐藏层维度
 
         # 1. 零件嵌入层 (Input Embedding)
@@ -31,6 +36,8 @@ class AttentionFeatureExtractor(BaseFeaturesExtractor):
             nn.ReLU(),
             nn.Linear(self.embed_dim, self.embed_dim),
         )
+        self.task_position_embedding = nn.Embedding(
+            self.max_items, self.embed_dim)
 
         # 2. 全局前缀编码器 (处理 Global Feats)
         if self.global_prefix_dim > 0:
@@ -59,55 +66,55 @@ class AttentionFeatureExtractor(BaseFeaturesExtractor):
         self.final_fc = nn.Linear(self.fusion_dim, features_dim)
         self.final_ln = nn.LayerNorm(features_dim)
 
+    def _split_observation(self, observations: torch.Tensor):
+        if observations.shape[-1] != self.layout.obs_dim:
+            raise ValueError(
+                f"Expected observation width {self.layout.obs_dim}, "
+                f"got {observations.shape[-1]}"
+            )
+        prefix_input = observations[:, :self.global_prefix_dim]
+        task_input = observations[:, self.layout.task_slice]
+        task_tokens = task_input.reshape(
+            observations.shape[0], self.max_items, self.item_dim)
+        return prefix_input, task_tokens
+
+    def _valid_task_mask(self, task_tokens: torch.Tensor) -> torch.Tensor:
+        return task_tokens[..., self.layout.task_valid_index] > 0.5
+
+    def _encode_task_sequence(self, task_tokens: torch.Tensor) -> torch.Tensor:
+        valid_task_mask = self._valid_task_mask(task_tokens)
+        original_padding_mask = ~valid_task_mask
+
+        embeddings = self.item_encoder(task_tokens)
+        positions = torch.arange(
+            self.max_items, device=task_tokens.device)
+        position_embeddings = self.task_position_embedding(positions).unsqueeze(0)
+        embeddings = embeddings + position_embeddings * valid_task_mask.unsqueeze(-1)
+
+        safe_padding_mask = original_padding_mask.clone()
+        all_padding_rows = safe_padding_mask.all(dim=1)
+        if all_padding_rows.any():
+            safe_padding_mask[all_padding_rows, 0] = False
+
+        trans_out = self.transformer(
+            embeddings, src_key_padding_mask=safe_padding_mask)
+
+        valid_weights = valid_task_mask.to(trans_out.dtype).unsqueeze(-1)
+        masked_out = trans_out * valid_weights
+        num_valid = valid_weights.sum(dim=1).clamp(min=1.0)
+        return masked_out.sum(dim=1) / num_valid
+
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         # 数值清洗
         if torch.isnan(observations).any():
             observations = torch.nan_to_num(observations, 0.0)
 
-        batch_size = observations.shape[0]
-
-        # === A. 全局前缀处理 ===
-        global_feat = None
-        if self.global_prefix_dim > 0:
-            prefix_input = observations[:, :self.global_prefix_dim]
-            global_feat = self.prefix_encoder(prefix_input)
-            seq_input = observations[:, self.global_prefix_dim:]
-        else:
-            seq_input = observations
-
-        # === B. 序列处理 ===
-        # [Batch, Max_Items, Item_Dim]
-        x = seq_input.view(batch_size, -1, self.item_dim)
-
-        # 生成 Padding Mask (True 表示该位置是 Padding，需要被忽略)
-        # 注意：PyTorch Transformer 的 src_key_padding_mask 逻辑是 True 代表忽略
-        # 我们检测全0特征
-        is_padding = (torch.sum(torch.abs(x), dim=2) < 1e-6)  # [Batch, Max_Items]
-
-        # Embedding
-        embeddings = self.item_encoder(x)  # [Batch, Max_Items, 128]
-
-        # 🟢 Transformer Self-Attention
-        # 这里发生了魔法：零件之间互相"看"到了对方
-        trans_out = self.transformer(embeddings, src_key_padding_mask=is_padding)
-
-        # === C. 全局聚合 ===
-        # 使用 Mask 进行 Mean Pooling
-        # 反转 mask (0.0 表示 padding, 1.0 表示 valid)
-        valid_mask = (~is_padding).float().unsqueeze(-1)  # [Batch, Max_Items, 1]
-
-        masked_out = trans_out * valid_mask
-        num_valid = torch.sum(valid_mask, dim=1)
-        num_valid = torch.clamp(num_valid, min=1.0)
-
-        # 聚合出"当前的排样局势"
-        seq_context = torch.sum(masked_out, dim=1) / num_valid  # [Batch, 128]
+        prefix_input, task_tokens = self._split_observation(observations)
+        global_feat = self.prefix_encoder(prefix_input)
+        seq_context = self._encode_task_sequence(task_tokens)
 
         # === D. 融合输出 ===
-        if global_feat is not None:
-            final_input = torch.cat([global_feat, seq_context], dim=1)
-        else:
-            final_input = seq_context
+        final_input = torch.cat([global_feat, seq_context], dim=1)
 
         out = self.final_fc(final_input)
         # 最后的数值稳定

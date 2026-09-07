@@ -32,6 +32,7 @@ from integration.scheduling_terminal_reward import SchedulingTerminalRewardWrapp
 from models.pointer_extractor import NestingModel
 from models.attention_extractor import AttentionFeatureExtractor
 from config import TRAIN_CONFIG, MAX_PARTS_CAPACITY
+from core.scheduling_observation import SchedulingObservationLayout
 
 try:
     from custom_callbacks import TensorboardCallback, SnapshotCallback
@@ -288,14 +289,12 @@ class NestingPPO:
 # Scheduling 侧
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_sched_policy_kwargs():
-    from config import MAX_SCHED_TASKS_CAPACITY
+def make_sched_policy_kwargs(layout: SchedulingObservationLayout):
     return dict(
         features_extractor_class=AttentionFeatureExtractor,
         features_extractor_kwargs=dict(
             features_dim=256,
-            item_dim=4,
-            global_prefix_dim=14,
+            layout=layout,
         ),
         activation_fn=nn.Tanh,
         net_arch=dict(pi=[256, 256], vf=[256, 256])
@@ -393,7 +392,7 @@ def main():
         sched_env, provider_nest_env, provider_predictor)
     sched_env_masked = ActionMasker(sched_provider, mask_fn)
 
-    pk_sched = make_sched_policy_kwargs()
+    pk_sched = make_sched_policy_kwargs(sched_env.observation_layout)
     print("Init Scheduling PPO (SB3)...")
     sched_model = MaskablePPO(
         "MlpPolicy", sched_env_masked, policy_kwargs=pk_sched,
