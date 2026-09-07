@@ -10,6 +10,7 @@ from models.sched_policy_loader import load_scheduling_policy
 
 from envs.packing_envs import NestingSchedulingEnv
 from envs.scheduling_env import SchedulingEnv
+from integration.scheduling_terminal_reward import SchedulingTerminalRewardWrapper
 from models.pointer_extractor import NestingModel
 from heuristic.blf_skyline_maxrects import PlateLayoutManager
 from heuristic.scheduler import SchedulerStateMachine
@@ -465,11 +466,10 @@ def main():
     # ── 3. RL 推理 ─────────────────────────────────────────────────────────────
     print("\n[Player 1] Dual-Agent RL ...")
     rl_env = NestingSchedulingEnv()
-    if sched_model:
-        rl_env.set_scheduling_partner(sched_model)
-
-    rl_env = run_rl_episode(
-        rl_env, nest_model, device=device,
+    rl_evaluator = SchedulingTerminalRewardWrapper(
+        rl_env, evaluation_mode="edd")
+    run_rl_episode(
+        rl_evaluator, nest_model, device=device,
         seed=SEED,
         options={"num_parts": TEST_N, "plate_size": (TEST_W, TEST_H)},
     )

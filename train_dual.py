@@ -2,16 +2,10 @@
 train_dual.py  —  协同优化训练循环
 
 架构：
-  Nesting  : NestingModel + NestingResultEncoder（自定义 PPO）
-  Scheduling: MaskablePPO（sb3_contrib）+ AttentionFeatureExtractor + SchedulingIntentEncoder
+  Nesting  : NestingModel（自定义 PPO）
+  Scheduling: MaskablePPO（sb3_contrib）+ AttentionFeatureExtractor
 
-协同优化改进：
-  1. 联合终局奖励：Nesting 终局时调用真实 Scheduling agent 做调度 rollout，
-     用真实 JIT 成本替代 EDD 代理 → 两个 agent 优化同一个目标函数
-  2. 可训练通信：NestingResultEncoder 参数纳入 Nesting 优化器，
-     SchedulingIntentEncoder 参数纳入 Scheduling 的 policy parameters
-     → 通信向量可被梯度更新，携带真实策略意图
-  3. Phase 3 联合微调时学习率余弦退火
+Patch 2：环境边界和终局调度 rollout 由 integration wrappers 协调。
 
 训练流程：
   Phase 1: Nesting 预热（EDD fallback，通信向量全零）
@@ -33,6 +27,8 @@ from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
 
 from envs.packing_envs import NestingSchedulingEnv
 from envs.scheduling_env import SchedulingEnv
+from integration.scheduling_problem_provider import SchedulingProblemProviderWrapper
+from integration.scheduling_terminal_reward import SchedulingTerminalRewardWrapper
 from models.pointer_extractor import NestingModel
 from models.attention_extractor import AttentionFeatureExtractor
 from config import TRAIN_CONFIG, MAX_PARTS_CAPACITY
@@ -84,9 +80,7 @@ class NestingPPO:
     """
     专为 NestingModel 设计的 PPO 训练器。
 
-    协同改进：
-    - NestingResultEncoder 的参数纳入 optimizer，使排样摘要向量可训练
-    - 通过 env 的 joint_reward_calc 使用真实调度结果计算终局奖励
+    终局调度 reward 由外部 wrapper 在 transition 返回前注入。
     """
 
     def __init__(
@@ -119,10 +113,7 @@ class NestingPPO:
         self.n_epochs    = n_epochs
         self.total_steps = 0
 
-        # 将 NestingResultEncoder 的参数也纳入优化器
-        # 这样排样摘要向量可以被 nesting 的梯度更新
-        all_params = list(model.parameters()) + list(env.nesting_result_encoder.parameters())
-        self.optimizer = optim.Adam(all_params, lr=lr)
+        self.optimizer = optim.Adam(model.parameters(), lr=lr)
 
     def set_lr(self, new_lr: float):
         for param_group in self.optimizer.param_groups:
@@ -363,9 +354,7 @@ def main():
     steps    = TRAIN_CONFIG['steps_per_cycle']
 
     # ── 环境 ──
-    nest_env  = NestingSchedulingEnv()
-    sched_env = SchedulingEnv()
-    sched_env_masked = ActionMasker(sched_env, mask_fn)
+    nest_base = NestingSchedulingEnv()
 
     # ── 模型 ──
     nesting_model = NestingModel(
@@ -379,7 +368,7 @@ def main():
     )
 
     nesting_ppo = NestingPPO(
-        env=nest_env,
+        env=nest_base,
         model=nesting_model,
         lr=lr_start,
         gamma=0.99,
@@ -394,6 +383,16 @@ def main():
         device=device,
     )
 
+    terminal_nest_env = SchedulingTerminalRewardWrapper(
+        nest_base, evaluation_mode="edd")
+    nesting_ppo.env = terminal_nest_env
+    provider_nest_env = NestingSchedulingEnv()
+    provider_predictor = NestingModelPredictor(nesting_ppo, provider_nest_env)
+    sched_env = SchedulingEnv()
+    sched_provider = SchedulingProblemProviderWrapper(
+        sched_env, provider_nest_env, provider_predictor)
+    sched_env_masked = ActionMasker(sched_provider, mask_fn)
+
     pk_sched = make_sched_policy_kwargs()
     print("Init Scheduling PPO (SB3)...")
     sched_model = MaskablePPO(
@@ -403,20 +402,18 @@ def main():
         ent_coef=0.05, tensorboard_log=log_s, verbose=1,
         max_grad_norm=0.1, clip_range=0.1
     )
-
     # ── Phase 1：Nesting 预热 ─────────────────────────────────────────────
-    # 此时无 scheduling partner，终局奖励用 EDD fallback
-    print(f"\n{'='*60}\nPhase 1: Nesting Warm-up (EDD fallback for terminal reward)\n{'='*60}")
-    nest_env.set_scheduling_partner(None)
-    nest_env.set_scheduling_for_reward(None, None)  # 无真实调度
+    # 显式使用 EDD terminal evaluator；这不是 policy rollout 的异常 fallback。
+    print(f"\n{'='*60}\nPhase 1: Nesting Warm-up (explicit EDD terminal evaluation)\n{'='*60}")
     nesting_ppo.learn(steps * 10, save_path=save_dir, tag="nesting_phase1")
 
     # ── Phase 2：Scheduling 适应 ──────────────────────────────────────────
     print(f"\n{'='*60}\nPhase 2: Scheduling Adaptation\n{'='*60}")
-    predictor = NestingModelPredictor(nesting_ppo, nest_env)
-    sched_env.set_nesting_partner(ActionMasker(nest_env, mask_fn), predictor)
     sched_model.learn(steps * 10, reset_num_timesteps=False)
     sched_model.save(f"{save_dir}/scheduling_phase2")
+
+    # Phase 3 使用当前 scheduling policy；保留同一个 wrapper 和 EMA transform。
+    terminal_nest_env.set_evaluator("policy", scheduling_policy=sched_model)
 
     # ── Phase 3：联合微调（核心改进）─────────────────────────────────────
     # 启用联合终局奖励：Nesting 终局时调用真实 Scheduling agent
@@ -433,14 +430,9 @@ def main():
         print(f"  Nesting LR: {cos_lr:.6f}")
 
         # ── Nesting 训练：启用联合终局奖励 ──
-        nest_env.set_scheduling_partner(sched_model)
-        # 关键：注入 sched_env 和 sched_model，使终局奖励用真实调度
-        nest_env.set_scheduling_for_reward(sched_env, sched_model)
         nesting_ppo.learn(steps, save_path=save_dir, tag=f"nesting_joint_c{c+1}")
 
         # ── Scheduling 训练 ──
-        predictor = NestingModelPredictor(nesting_ppo, nest_env)
-        sched_env.set_nesting_partner(ActionMasker(nest_env, mask_fn), predictor)
         sched_model.learn(steps, reset_num_timesteps=False)
         sched_model.save(f"{save_dir}/scheduling_joint_c{c+1}")
 

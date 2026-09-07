@@ -1,12 +1,9 @@
 """
 envs/packing_envs.py
 
-协同优化改进：
-  - 终局奖励通过 JointRewardCalculator 计算
-  - Phase 1 (无 scheduling partner): EDD fallback
-  - Phase 2+ (有 scheduling partner): 用真实 Scheduling agent rollout
-  - 两个 agent 共享同一个 GlobalCostFunction，消除评价标准分歧
-  - NestingResultEncoder 参数纳入 NestingModel 优化器（在 train_dual.py 中配置）
+Patch 2 boundary:
+  - this environment owns only production instance and nesting state;
+  - terminal scheduling evaluation is performed by integration wrappers.
 
 解耦接口：
   get_part_feats()  → [max_capacity, 5]  供 PartEncoder
@@ -22,12 +19,9 @@ from gymnasium import spaces
 from heuristic.blf_skyline_maxrects import PlateLayoutManager
 from heuristic.scheduler import SchedulerStateMachine
 from config import MAX_PARTS_CAPACITY, TRAIN_CONFIG, MAX_SCHED_TASKS_CAPACITY, COST_CONFIG, FEATURE_CONFIG
-from core.cost import GlobalCostFunction
 from core.instance import ProductionInstance, generate_instance
 from core.processing import parts_cutting_time, plate_processing_time
-from models.comm_encoders import (
-    NestingResultEncoder, JointRewardCalculator
-)
+from core.scheduling_problem import NestingTerminalResult, NestedPlateResult
 
 
 class NestingSchedulingEnv(gym.Env):
@@ -73,7 +67,6 @@ class NestingSchedulingEnv(gym.Env):
         self.action_space = spaces.Discrete(self.max_capacity * 2 * self.num_strategies)
 
         self.scheduler_state_machine = SchedulerStateMachine(num_machines=3)
-        self.scheduler_model = None
         self.parts_pool      = []
         self.orders          = {}
         self.packed_indices  = set()
@@ -84,40 +77,7 @@ class NestingSchedulingEnv(gym.Env):
         # 通信向量初始化
         self.sched_intent_vec   = np.zeros(self.COMM_DIM_IN,  dtype=np.float32)
         self.nesting_result_vec = np.zeros(self.COMM_DIM_OUT, dtype=np.float32)
-        self.nesting_result_encoder = NestingResultEncoder(input_dim=8, comm_dim=8)
-
-        # ── 协同优化核心：联合奖励计算器 ──
-        self.global_cost_fn = GlobalCostFunction(
-            cost_mat=self.COST_MAT,
-            cost_hold=self.COST_HOLD,
-            cost_tard=self.COST_TARD,
-            cutting_speed=self.CUTTING_SPEED,
-        )
-        self.joint_reward_calc = JointRewardCalculator(
-            global_cost_fn=self.global_cost_fn,
-            num_machines=self.scheduler_state_machine.num_machines,
-        )
-
-        # Scheduling 侧引用（Phase 2+ 时注入）
-        self._sched_env_for_reward   = None
-        self._sched_model_for_reward = None
-
-    # ── 合作接口 ─────────────────────────────────────────────────────────────
-
-    def set_scheduling_partner(self, model):
-        """设置调度 partner（model 用于通信向量，reward 用另一个接口）"""
-        self.scheduler_model = model
-
-    def set_scheduling_for_reward(self, sched_env, sched_model):
-        """
-        注入 Scheduling env 和 model，用于终局奖励的真实调度 rollout。
-        在 train_dual.py Phase 2+ 中调用。
-        """
-        self._sched_env_for_reward   = sched_env
-        self._sched_model_for_reward = sched_model
-
-    def set_scheduling_intent(self, intent_vec: np.ndarray):
-        self.sched_intent_vec = np.array(intent_vec, dtype=np.float32)
+        self.current_instance = None
 
     # ── Reset ────────────────────────────────────────────────────────────────
 
@@ -131,10 +91,11 @@ class NestingSchedulingEnv(gym.Env):
                 raise TypeError("options['instance'] must be a ProductionInstance")
             if len(supplied_instance.parts) > self.max_capacity:
                 raise ValueError("ProductionInstance exceeds max part capacity")
-            self.current_num_parts = len(supplied_instance.parts)
-            self.plate_w, self.plate_h = supplied_instance.plate_w, supplied_instance.plate_h
-            self.parts_pool = copy.deepcopy(supplied_instance.parts)
-            self.orders = copy.deepcopy(supplied_instance.orders)
+            self.current_instance = copy.deepcopy(supplied_instance)
+            self.current_num_parts = len(self.current_instance.parts)
+            self.plate_w, self.plate_h = self.current_instance.plate_w, self.current_instance.plate_h
+            self.parts_pool = copy.deepcopy(self.current_instance.parts)
+            self.orders = copy.deepcopy(self.current_instance.orders)
         elif 'num_parts' in options:
             self.current_num_parts = options['num_parts']
         else:
@@ -148,7 +109,14 @@ class NestingSchedulingEnv(gym.Env):
                 lo, hi = TRAIN_CONFIG['min_plate_dim'], TRAIN_CONFIG['max_plate_dim']
                 self.plate_w = int(self.np_random.integers(lo, hi + 1))
                 self.plate_h = int(self.np_random.integers(lo, hi + 1))
-            self.parts_pool, self.orders = self._generate_random_orders(seed=seed)
+            self.current_instance = generate_instance(
+                seed=seed, num_parts=self.current_num_parts,
+                plate_size=(self.plate_w, self.plate_h),
+                num_machines=self.scheduler_state_machine.num_machines,
+                cutting_speed=self.CUTTING_SPEED, rng=self.np_random,
+            )
+            self.parts_pool = copy.deepcopy(self.current_instance.parts)
+            self.orders = copy.deepcopy(self.current_instance.orders)
         self.episode_time_scale = max(10.0, parts_cutting_time(self.parts_pool, self.CUTTING_SPEED))
 
         self.packed_indices  = set()
@@ -156,7 +124,10 @@ class NestingSchedulingEnv(gym.Env):
         self.active_plates   = [PlateLayoutManager(width=self.plate_w, height=self.plate_h)]
         self.history_plates  = []
         self.cost_metrics    = {}
-        self.sched_intent_vec   = np.zeros(self.COMM_DIM_IN,  dtype=np.float32)
+        context = np.asarray(options.get("scheduling_context", np.zeros(self.COMM_DIM_IN)), dtype=np.float32)
+        if context.shape != (self.COMM_DIM_IN,):
+            raise ValueError(f"scheduling_context must have shape ({self.COMM_DIM_IN},)")
+        self.sched_intent_vec = context.copy()
         self.nesting_result_vec = np.zeros(self.COMM_DIM_OUT, dtype=np.float32)
 
         return self._get_obs(), {"action_mask": self._get_action_mask()}
@@ -219,11 +190,7 @@ class NestingSchedulingEnv(gym.Env):
 
         progress = len(self.packed_indices) / max(1, self.current_num_parts)
 
-        if self.scheduler_model:
-            m_rel = (mach_times - curr_time) / safe_scale
-            mach_load_avg, mach_load_std = float(np.mean(m_rel)), float(np.std(m_rel))
-        else:
-            mach_load_avg = mach_load_std = 0.0
+        mach_load_avg = mach_load_std = 0.0
 
         act_due_std = order_frag_idx = proj_tardiness = mach_idle_gap = 0.0
         if self.active_plates and self.active_plates[-1].placed_parts:
@@ -322,37 +289,18 @@ class NestingSchedulingEnv(gym.Env):
             self.history_plates = self.active_plates
             final_plates = [p for p in self.history_plates if len(p.placed_parts) > 0]
 
-            # ── 协同优化核心：用联合奖励计算器替代独立的 EDD 模拟 ──
-            cost_dict = self.joint_reward_calc.compute_terminal_cost(
-                plates=final_plates,
-                orders=self.orders,
-                parts_pool=self.parts_pool,
-                plate_w=self.plate_w,
-                plate_h=self.plate_h,
-                sched_env=self._sched_env_for_reward,
-                sched_model=self._sched_model_for_reward,
+            snapshots = tuple(
+                NestedPlateResult(
+                    plate_index=index,
+                    placed_parts=tuple(
+                        (float(p[0]), float(p[1]), float(p[2]), float(p[3]), int(p[4]), bool(p[5]))
+                        for p in plate.placed_parts
+                    ),
+                )
+                for index, plate in enumerate(final_plates)
             )
-
-            # 终局奖励：共享的 reward 转换逻辑（含 EMA baseline 方差缩减）
-            scaled_reward = self.joint_reward_calc.to_reward(
-                cost_dict, w_terminal=self.w_terminal)
-            reward += scaled_reward
-
-            # 编码排样结果摘要
-            self.nesting_result_vec = self.nesting_result_encoder.encode_result(
-                self.history_plates, self.orders, self.parts_pool,
-                self.plate_w * self.plate_h)
-
-            self.cost_metrics = {
-                "cost_material": cost_dict['cost_material'],
-                "cost_jit": cost_dict['cost_jit'],
-                "cost_total": cost_dict['cost_total'],
-                "utilization": cost_dict['utilization'],
-                "plate_count": cost_dict['plate_count'],
-                "total_delay": cost_dict['total_delay'],
-                "norm_reward": scaled_reward,
-            }
-            info["episode_metrics"] = self._compute_metrics()
+            info["terminal_result"] = NestingTerminalResult(
+                instance=self.current_instance, plates=snapshots)
 
         info["action_mask"] = self._get_action_mask()
         return self._get_obs(), reward, terminated, False, info

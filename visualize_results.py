@@ -171,8 +171,6 @@ def main():
     nest_model = MaskablePPO.load(nest_path)
     sched_model = MaskablePPO.load(sched_path)
 
-    nest_env.unwrapped.set_scheduling_partner(sched_model)
-
     print("🚀 正在生成排样方案...")
     # 🟢 固定种子和参数进行展示
     obs, _ = nest_env.reset(seed=42, options={"num_parts": 50, "plate_size": (200, 200)})

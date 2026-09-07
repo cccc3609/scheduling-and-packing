@@ -4,6 +4,7 @@ import pytest
 from core.cost import GlobalCostFunction
 from core.instance import generate_instance
 from core.processing import plate_processing_time
+from core.scheduling_problem import build_scheduling_problem
 from heuristic.scheduler import SchedulerStateMachine
 
 
@@ -44,46 +45,15 @@ def test_processing_time_is_unique():
     # environment must execute the real SchedulingEnv path, never skip it.
     from envs.scheduling_env import SchedulingEnv
 
-    class NestingStub:
-        def __init__(self):
-            self.parts_pool = [
-                {"w": 10, "h": 20, "area": 200, "order_id": 0, "due_date": 100.0},
-                {"w": 5, "h": 5, "area": 25, "order_id": 0, "due_date": 100.0},
-            ]
-            self.orders = {0: {"due_date": 100.0, "finished_time": 0.0}}
-            self.plate_w = self.plate_h = 100
-            self.CUTTING_SPEED = 10.0
-            self.episode_time_scale = 10.0
-            self.current_num_parts = 0
-            self.packed_indices = set()
-            self.history_plates = [_Plate([
-                (0, 0, 10, 20, 0, False), (10, 0, 5, 5, 0, False),
-            ])]
-            self.nesting_result_vec = np.zeros(8, dtype=np.float32)
-
-        @property
-        def unwrapped(self):
-            return self
-
-        def reset(self, seed=None):
-            return np.zeros(1, dtype=np.float32), {}
-
-        def action_masks(self):
-            return np.ones(1, dtype=bool)
-
-        def step(self, action):
-            return np.zeros(1, dtype=np.float32), 0.0, True, False, {}
-
-        def set_scheduling_intent(self, intent):
-            self.intent = intent
-
-    class ModelStub:
-        def predict(self, obs, action_masks=None, deterministic=True):
-            return 0, None
-
+    instance = generate_instance(seed=7, num_parts=2, plate_size=(100, 100), num_machines=1)
+    instance.parts = [
+        {"w": 10, "h": 20, "area": 200, "order_id": 0, "due_date": 100.0},
+        {"w": 5, "h": 5, "area": 25, "order_id": 0, "due_date": 100.0},
+    ]
+    instance.orders = {0: {"due_date": 100.0, "finished_time": 0.0}}
+    problem = build_scheduling_problem(instance, [plate])
     env = SchedulingEnv(num_machines=1, max_tasks=2)
-    env.set_nesting_partner(NestingStub(), ModelStub())
-    env.reset(seed=7)
+    env.reset(seed=7, options={"problem": problem, "nesting_context": np.zeros(8)})
     assert env.task_pool[0]["cut"] == pytest.approx(expected)
 
 

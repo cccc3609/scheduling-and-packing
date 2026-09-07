@@ -12,6 +12,7 @@ from sb3_contrib.common.wrappers import ActionMasker
 # 引入项目模块
 from envs.packing_envs import NestingSchedulingEnv
 from envs.scheduling_env import SchedulingEnv
+from integration.scheduling_terminal_reward import SchedulingTerminalRewardWrapper
 from models.attention_extractor import AttentionFeatureExtractor
 from config import COST_CONFIG, TRAIN_CONFIG
 
@@ -221,16 +222,16 @@ def main():
     if not nest_path: return
 
     # 初始化环境
-    nest_env = NestingSchedulingEnv()
-    nest_env = ActionMasker(nest_env, mask_fn)
+    nest_base = NestingSchedulingEnv()
+    nest_terminal_env = SchedulingTerminalRewardWrapper(
+        nest_base, evaluation_mode="edd")
+    nest_env = ActionMasker(nest_terminal_env, mask_fn)
     sched_env = SchedulingEnv()
     sched_env = ActionMasker(sched_env, mask_fn)
 
     print("Loading Models...")
     nest_model = MaskablePPO.load(nest_path)
     sched_model = MaskablePPO.load(sched_path)
-
-    nest_env.unwrapped.set_scheduling_partner(sched_model)
 
     print("Generating Visualization...")
 

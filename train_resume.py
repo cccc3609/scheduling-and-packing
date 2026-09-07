@@ -9,6 +9,8 @@ from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
 # 引入项目模块
 from envs.packing_envs import NestingSchedulingEnv
 from envs.scheduling_env import SchedulingEnv
+from integration.scheduling_problem_provider import SchedulingProblemProviderWrapper
+from integration.scheduling_terminal_reward import SchedulingTerminalRewardWrapper
 from custom_callbacks import TensorboardCallback, SnapshotCallback
 from config import TRAIN_CONFIG
 
@@ -27,6 +29,14 @@ TOTAL_CYCLES = 50
 
 def mask_fn(env):
     return env.get_wrapper_attr("_get_action_mask")()
+
+
+def build_resume_nesting_env():
+    """Restore the pre-Patch-2 resume terminal semantics via explicit EDD."""
+    nest_base = NestingSchedulingEnv()
+    nest_terminal_env = SchedulingTerminalRewardWrapper(
+        nest_base, evaluation_mode="edd")
+    return ActionMasker(nest_terminal_env, mask_fn)
 
 
 # 指数衰减调度器 (与 train_dual.py 保持一致)
@@ -90,11 +100,9 @@ def main():
     # 3. 初始化环境 (使用修复后的最新代码)
     # 这里的环境已经包含了最新的防崩逻辑
     print("⏳ 初始化环境...")
-    nest_env = NestingSchedulingEnv()
-    nest_env = ActionMasker(nest_env, mask_fn)
+    nest_env = build_resume_nesting_env()
 
-    sched_env = SchedulingEnv()
-    sched_env = ActionMasker(sched_env, mask_fn)
+    sched_base = SchedulingEnv()
 
     # 4. 加载旧模型
     print(f"🔥 加载旧模型 (Cycle {last_completed_cycle})...")
@@ -120,7 +128,8 @@ def main():
         print_system_info=True
     )
 
-    # train_resume.py
+    sched_env = ActionMasker(
+        SchedulingProblemProviderWrapper(sched_base, nest_env, nest_model), mask_fn)
 
     # 加载 Scheduling
     sched_model = MaskablePPO.load(
@@ -132,12 +141,7 @@ def main():
         device="cpu",
         force_reset=True
     )
-    # 5. 注入伙伴
-    print("🔗 链接双智能体...")
-    nest_env.unwrapped.set_scheduling_partner(sched_model)
-    sched_env.unwrapped.set_nesting_partner(nest_env, nest_model)
-
-    # 6. 回调
+    # 5. 回调
     cb = CallbackList([
         CheckpointCallback(50000, save_dir, name_prefix="nest"),
         TensorboardCallback(),
@@ -153,13 +157,11 @@ def main():
 
         # 训练 Nesting
         print(">>> Training Nesting...")
-        nest_env.unwrapped.set_scheduling_partner(sched_model)
         nest_model.learn(steps, reset_num_timesteps=False, callback=cb)
         nest_model.save(f"{save_dir}/nesting_c{c}")
 
         # 训练 Scheduling
         print(">>> Training Scheduling...")
-        sched_env.unwrapped.set_nesting_partner(nest_env, nest_model)
         sched_model.learn(steps, reset_num_timesteps=False)
         sched_model.save(f"{save_dir}/scheduling_c{c}")
 

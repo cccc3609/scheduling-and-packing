@@ -12,6 +12,7 @@ from tqdm import tqdm
 from models.sched_policy_loader import load_scheduling_policy
 
 from envs.packing_envs import NestingSchedulingEnv
+from integration.scheduling_terminal_reward import SchedulingTerminalRewardWrapper
 from models.pointer_extractor import NestingModel
 from heuristic.blf_skyline_maxrects import PlateLayoutManager
 from heuristic.scheduler import SchedulerStateMachine
@@ -112,10 +113,8 @@ def run_rl_episode(
     plate_size: tuple,
 ) -> NestingSchedulingEnv:
     """每局创建新环境，避免状态污染。"""
-    env = NestingSchedulingEnv()
-    if sched_model is not None:
-        env.set_scheduling_partner(sched_model)
-
+    base_env = NestingSchedulingEnv()
+    env = SchedulingTerminalRewardWrapper(base_env, evaluation_mode="edd")
     obs, _ = env.reset(
         seed=seed,
         options={"num_parts": num_parts, "plate_size": plate_size},
@@ -137,7 +136,7 @@ def run_rl_episode(
         obs, _, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
 
-    return env
+    return base_env
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

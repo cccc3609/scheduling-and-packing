@@ -19,11 +19,9 @@ envs/scheduling_env.py
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
-import copy
 from config import MAX_SCHED_TASKS_CAPACITY, COST_CONFIG, TRAIN_CONFIG
 from core.cost import GlobalCostFunction
-from core.processing import parts_cutting_time, plate_processing_time
-from models.comm_encoders import SchedulingIntentEncoder
+from core.scheduling_problem import SchedulingProblem
 
 
 class SchedulingEnv(gym.Env):
@@ -53,8 +51,6 @@ class SchedulingEnv(gym.Env):
         self.machine_times = np.zeros(num_machines)
         self.scheduled_mask = np.zeros(self.max_tasks, dtype=bool)
         self.orders_snapshot = {}
-        self.nesting_env   = None
-        self.nesting_model = None
 
         _max_dim = TRAIN_CONFIG.get('max_plate_dim', 300)
         self.val_norm = float(_max_dim * _max_dim)
@@ -72,12 +68,6 @@ class SchedulingEnv(gym.Env):
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(dim,), dtype=np.float32)
 
-        self.intent_encoder = SchedulingIntentEncoder(input_dim=12, comm_dim=16)
-
-    def set_nesting_partner(self, env, model):
-        self.nesting_env   = env
-        self.nesting_model = model
-
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         self.machine_times  = np.zeros(self.num_machines)
@@ -86,72 +76,38 @@ class SchedulingEnv(gym.Env):
         self.episode_time_scale = 100.0
         self.baseline_cost  = 100.0
         self.plate_area     = 40000.0
-        self.nesting_result_vec = np.zeros(self.COMM_DIM_IN, dtype=np.float32)
-
-        if self.nesting_env:
-            real = self.nesting_env.unwrapped
-
-            # ── 先 reset nesting env，拿到订单数据 ──
-            obs, _ = self.nesting_env.reset(seed=seed)
-            self.episode_time_scale = max(10.0, float(real.episode_time_scale))
-            self.plate_w    = real.plate_w
-            self.plate_h    = real.plate_h
-            self.plate_area = max(1.0, float(self.plate_w * self.plate_h))
-
-            self.orders_snapshot = copy.deepcopy(real.orders)
-            total_all_area = 0.0
-            for oid in self.orders_snapshot:
-                parts = [p for p in real.parts_pool if p['order_id'] == oid]
-                area  = sum(p['area'] for p in parts)
-                self.orders_snapshot[oid]['total_area'] = area
-                self.orders_snapshot[oid]['proc_time']  = max(
-                    1.0, parts_cutting_time(parts, real.CUTTING_SPEED))
-                self.orders_snapshot[oid]['finished_time'] = 0.0
-                total_all_area += area
-            self.baseline_cost = max(1.0, total_all_area * self.COST_TARD * 100.0)
-
-            # intent 生成在 rollout 开始前
-            intent_vec = self.intent_encoder.encode_orders(
-                self.orders_snapshot,
-                real.parts_pool,
-                self.num_machines,
-                real.CUTTING_SPEED
-            )
-            if hasattr(real, 'set_scheduling_intent'):
-                real.set_scheduling_intent(intent_vec)
-
-            # 修复：通知 predictor 清空 H 缓存（如果支持）
-            if hasattr(self.nesting_model, 'reset_cache'):
-                self.nesting_model.reset_cache()
-
-            # ── nesting rollout ──
-            done = False
-            while not done:
-                try:
-                    m = self.nesting_env.action_masks()
-                except Exception:
-                    m = real._get_action_mask()
-                a, _ = self.nesting_model.predict(obs, action_masks=m, deterministic=True)
-                obs, _, done, _, _ = self.nesting_env.step(a)
-
-            # rollout 完成后读取排样摘要
-            if hasattr(real, 'nesting_result_vec'):
-                self.nesting_result_vec = real.nesting_result_vec.copy()
-
-            for i, plate in enumerate(real.history_plates):
-                if i >= self.max_tasks:
-                    break
-                if not plate.placed_parts:
-                    continue
-                cut  = plate_processing_time(plate.placed_parts, real.CUTTING_SPEED)
-                oids = list(set(int(p[4]) for p in plate.placed_parts))
-                val  = sum(p[2]*p[3] for p in plate.placed_parts)
-                due  = min((self.orders_snapshot[o]['due_date']
-                            for o in oids if o in self.orders_snapshot),
-                           default=9999.0)
-                self.task_pool.append({'cut': cut, 'due': due, 'oids': oids, 'val': val})
-        else:
-            self.task_pool = [{'cut': 10, 'due': 100, 'oids': [], 'val': 100}]
+        options = options or {}
+        problem = options.get("problem")
+        if not isinstance(problem, SchedulingProblem):
+            raise ValueError("SchedulingEnv.reset requires options={'problem': SchedulingProblem}")
+        if problem.num_machines != self.num_machines:
+            raise ValueError("SchedulingProblem.num_machines does not match SchedulingEnv")
+        if len(problem.tasks) > self.max_tasks:
+            raise ValueError(
+                f"SchedulingProblem has {len(problem.tasks)} tasks, exceeds max_tasks={self.max_tasks}")
+        context = np.asarray(options.get("nesting_context", np.zeros(self.COMM_DIM_IN)), dtype=np.float32)
+        if context.shape != (self.COMM_DIM_IN,):
+            raise ValueError(f"nesting_context must have shape ({self.COMM_DIM_IN},)")
+        self.nesting_result_vec = context.copy()
+        self.episode_time_scale = float(problem.episode_time_scale)
+        self.plate_w, self.plate_h = problem.plate_w, problem.plate_h
+        self.plate_area = max(1.0, float(self.plate_w * self.plate_h))
+        self.orders_snapshot = {
+            order.order_id: {
+                "due_date": order.due_date,
+                "total_area": order.total_area,
+                "proc_time": order.proc_time,
+                "finished_time": 0.0,
+            }
+            for order in problem.orders
+        }
+        self.baseline_cost = max(
+            1.0, sum(order.total_area for order in problem.orders) * self.COST_TARD * 100.0)
+        self.task_pool = [
+            {"cut": task.processing_time, "due": task.due_date,
+             "oids": list(task.order_ids), "val": task.plate_part_area}
+            for task in problem.tasks
+        ]
 
         return self._get_obs(), {"action_mask": self._get_action_mask()}
 
@@ -160,17 +116,15 @@ class SchedulingEnv(gym.Env):
         scale = max(10.0, self.episode_time_scale)
         m_feat = (self.machine_times - min_t) / scale
 
-        upstream_workload = upstream_urgent_due = upstream_giant_ratio = 0.0
-        if self.nesting_env:
-            real_nest = self.nesting_env.unwrapped
-            rem = [i for i in range(real_nest.current_num_parts)
-                   if i not in real_nest.packed_indices]
-            if rem:
-                rp    = [real_nest.parts_pool[i] for i in rem]
-                upstream_workload  = parts_cutting_time(rp, real_nest.CUTTING_SPEED) / (self.num_machines * scale)
-                upstream_urgent_due = (min(p['due_date'] for p in rp) - min_t) / scale
-                giant = sum(1 for p in rp if p['area'] > (real_nest.plate_w * real_nest.plate_h) / 4.0)
-                upstream_giant_ratio = giant / len(rp)
+        total_work = sum(task['cut'] for task in self.task_pool)
+        upstream_workload = total_work / max(1.0, self.num_machines * scale)
+        upstream_urgent_due = (
+            min((task['due'] for task in self.task_pool), default=min_t) - min_t
+        ) / scale
+        upstream_giant_ratio = (
+            sum(task['val'] > self.plate_area / 4.0 for task in self.task_pool)
+            / max(1, len(self.task_pool))
+        )
         upstream_feats = [upstream_workload, upstream_urgent_due, upstream_giant_ratio]
 
         t_feat = []
