@@ -1,4 +1,31 @@
+import copy
+from dataclasses import dataclass
+
 import numpy as np
+
+
+@dataclass(frozen=True)
+class _PlateState:
+    placed_parts: tuple
+    used_area: float
+    free_rects: tuple
+    skyline: tuple
+    blf_points: tuple
+
+
+@dataclass(frozen=True)
+class PlacementCandidate:
+    """A deterministic fixed-orientation placement and its exact state delta."""
+
+    x: float
+    y: float
+    placed_w: float
+    placed_h: float
+    order_id: int
+    rotated: bool
+    strategy_id: int
+    source_state: _PlateState
+    result_state: _PlateState
 
 
 class PlateLayoutManager:
@@ -62,6 +89,128 @@ class PlateLayoutManager:
                     height_map[start_idx] = max(height_map[start_idx], norm_h)
 
         return height_map
+
+    def _snapshot_state(self):
+        return _PlateState(
+            placed_parts=tuple(self.placed_parts),
+            used_area=float(self.used_area),
+            free_rects=tuple(self.free_rects),
+            skyline=tuple(self.skyline),
+            blf_points=tuple(self.blf_points),
+        )
+
+    def _place_oriented_part(
+        self,
+        placed_w,
+        placed_h,
+        order_id,
+        strategy_id,
+        rotated,
+        min_rem_w=0.0,
+        min_rem_h=0.0,
+    ):
+        """Place one already-oriented part using exactly one strategy."""
+        result = self._try_strategies(
+            placed_w, placed_h, strategy_id, min_rem_w, min_rem_h)
+        if result is None:
+            return None
+
+        x, y = result[0], result[1]
+        self.placed_parts.append(
+            (x, y, placed_w, placed_h, order_id, bool(rotated)))
+        self.used_area += placed_w * placed_h
+        rect = (x, y, placed_w, placed_h)
+        self._update_maxrects(rect)
+        self._update_skyline(rect)
+        self._update_blf(rect)
+        return x, y
+
+    def find_fixed_placement(
+        self,
+        original_w,
+        original_h,
+        order_id,
+        rotation,
+        strategy_id,
+        min_rem_w=0.0,
+        min_rem_h=0.0,
+    ):
+        """Return a pure proposal for one exact rotation and one exact strategy."""
+        if rotation not in (0, 1, False, True):
+            raise ValueError("rotation must be 0 or 1")
+        if strategy_id not in (0, 1, 2):
+            raise ValueError("strategy_id must be 0, 1, or 2")
+
+        rotated = bool(rotation)
+        placed_w, placed_h = (
+            (original_h, original_w) if rotated
+            else (original_w, original_h)
+        )
+        source_state = self._snapshot_state()
+        proposal_plate = copy.deepcopy(self)
+        position = proposal_plate._place_oriented_part(
+            placed_w,
+            placed_h,
+            order_id,
+            strategy_id,
+            rotated,
+            min_rem_w,
+            min_rem_h,
+        )
+        if position is None:
+            return None
+
+        x, y = position
+        return PlacementCandidate(
+            x=x,
+            y=y,
+            placed_w=placed_w,
+            placed_h=placed_h,
+            order_id=order_id,
+            rotated=rotated,
+            strategy_id=strategy_id,
+            source_state=source_state,
+            result_state=proposal_plate._snapshot_state(),
+        )
+
+    def commit_fixed_placement(self, candidate):
+        """Atomically apply a proposal without running any placement search."""
+        if not isinstance(candidate, PlacementCandidate):
+            raise TypeError("candidate must be a PlacementCandidate")
+        if self._snapshot_state() != candidate.source_state:
+            return False
+
+        result = candidate.result_state
+        expected_part = (
+            candidate.x,
+            candidate.y,
+            candidate.placed_w,
+            candidate.placed_h,
+            candidate.order_id,
+            candidate.rotated,
+        )
+        if (
+            candidate.strategy_id not in (0, 1, 2)
+            or candidate.placed_w <= 0
+            or candidate.placed_h <= 0
+            or candidate.x < 0
+            or candidate.y < 0
+            or candidate.x + candidate.placed_w > self.width
+            or candidate.y + candidate.placed_h > self.height
+            or len(result.placed_parts) != len(candidate.source_state.placed_parts) + 1
+            or result.placed_parts[-1] != expected_part
+            or self._check_overlap((
+                candidate.x, candidate.y,
+                candidate.placed_w, candidate.placed_h,
+            ))
+        ):
+            return False
+        self.placed_parts = list(result.placed_parts)
+        self.used_area = result.used_area
+        self.free_rects = list(result.free_rects)
+        self.skyline = list(result.skyline)
+        self.blf_points = list(result.blf_points)
+        return True
 
     def place_part(self, part_w, part_h, order_id, strategy_id, min_rem_w=0.0, min_rem_h=0.0):
         """

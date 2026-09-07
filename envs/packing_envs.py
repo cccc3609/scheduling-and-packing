@@ -14,9 +14,10 @@ import gymnasium as gym
 import numpy as np
 import copy
 import math
+from dataclasses import dataclass
 from gymnasium import spaces
 
-from heuristic.blf_skyline_maxrects import PlateLayoutManager
+from heuristic.blf_skyline_maxrects import PlacementCandidate, PlateLayoutManager
 from heuristic.scheduler import SchedulerStateMachine
 from config import MAX_PARTS_CAPACITY, TRAIN_CONFIG, MAX_SCHED_TASKS_CAPACITY, COST_CONFIG, FEATURE_CONFIG
 from core.instance import ProductionInstance, generate_instance
@@ -24,10 +25,27 @@ from core.processing import parts_cutting_time, plate_processing_time
 from core.scheduling_problem import NestingTerminalResult, NestedPlateResult
 
 
+@dataclass(frozen=True)
+class _ResolvedNestingAction:
+    part_index: int
+    rotation: int
+    strategy_id: int
+    plate_index: int | None
+    target_plate: PlateLayoutManager
+    candidate: PlacementCandidate
+
+    @property
+    def opens_new_plate(self):
+        return self.plate_index is None
+
+
 class NestingSchedulingEnv(gym.Env):
 
     PART_FEAT_DIM  = 5
     STATE_FEAT_DIM = 57
+    NUM_ROTATIONS = 2
+    NUM_STRATEGIES = 3
+    ACTIONS_PER_PART = NUM_ROTATIONS * NUM_STRATEGIES
 
     def __init__(self, plate_size=(200, 200)):
         super().__init__()
@@ -55,16 +73,14 @@ class NestingSchedulingEnv(gym.Env):
         self.COMM_DIM_IN  = 16
         self.COMM_DIM_OUT = 8
         self.skyline_bins = FEATURE_CONFIG.get('skyline_bins', 20)
-        self.num_strategies = 3
-
-        # 掩码参数
-        self.max_mask_candidates = 20
+        self.num_strategies = self.NUM_STRATEGIES
 
         # obs 维度
         _obs_dim = self.max_capacity * self.PART_FEAT_DIM + self.STATE_FEAT_DIM
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(_obs_dim,), dtype=np.float32)
-        self.action_space = spaces.Discrete(self.max_capacity * 2 * self.num_strategies)
+        self.action_space = spaces.Discrete(
+            self.max_capacity * self.ACTIONS_PER_PART)
 
         self.scheduler_state_machine = SchedulerStateMachine(num_machines=3)
         self.parts_pool      = []
@@ -231,56 +247,85 @@ class NestingSchedulingEnv(gym.Env):
 
     # ── Step ─────────────────────────────────────────────────────────────────
 
+    def encode_action(self, part_index, rotation, strategy_id):
+        part_index = int(part_index)
+        rotation = int(rotation)
+        strategy_id = int(strategy_id)
+        if not 0 <= part_index < self.max_capacity:
+            raise ValueError("part_index is outside the action capacity")
+        if not 0 <= rotation < self.NUM_ROTATIONS:
+            raise ValueError("rotation must be 0 or 1")
+        if not 0 <= strategy_id < self.NUM_STRATEGIES:
+            raise ValueError("strategy_id must be 0, 1, or 2")
+        return (
+            part_index * self.ACTIONS_PER_PART
+            + rotation * self.NUM_STRATEGIES
+            + strategy_id
+        )
+
+    def decode_action(self, action):
+        action = int(action)
+        if not self.action_space.contains(action):
+            raise ValueError("action is outside the nesting action space")
+        part_index, action_offset = divmod(action, self.ACTIONS_PER_PART)
+        rotation, strategy_id = divmod(action_offset, self.NUM_STRATEGIES)
+        return part_index, rotation, strategy_id
+
+    def _resolve_action(self, action):
+        """Purely resolve one exact action to its first feasible candidate."""
+        part_index, rotation, strategy_id = self.decode_action(action)
+        if (part_index >= self.current_num_parts
+                or part_index in self.packed_indices):
+            return None
+
+        part = self.parts_pool[part_index]
+        for plate_index, plate in enumerate(self.active_plates):
+            candidate = plate.find_fixed_placement(
+                part['w'], part['h'], part['order_id'], rotation, strategy_id)
+            if candidate is not None:
+                return _ResolvedNestingAction(
+                    part_index, rotation, strategy_id,
+                    plate_index, plate, candidate)
+
+        blank_plate = PlateLayoutManager(
+            width=self.plate_w, height=self.plate_h)
+        candidate = blank_plate.find_fixed_placement(
+            part['w'], part['h'], part['order_id'], rotation, strategy_id)
+        if candidate is None:
+            return None
+        return _ResolvedNestingAction(
+            part_index, rotation, strategy_id, None, blank_plate, candidate)
+
     def step(self, action):
         if isinstance(action, np.ndarray):
             action = int(action)
 
-        strategy_id = action % self.num_strategies
-        is_rotated  = (action // self.num_strategies) % 2
-        part_index  = action // (self.num_strategies * 2)
+        resolved = self._resolve_action(action)
+        if resolved is None:
+            raise ValueError(
+                "Nesting action is infeasible under the current fixed "
+                "rotation/strategy contract"
+            )
 
-        if part_index >= self.current_num_parts or part_index in self.packed_indices:
-            return self._get_obs(), -5.0, True, False, {}
+        target = resolved.target_plate
+        old_util = target.utilization
+        last_util = (
+            self.active_plates[-1].utilization
+            if self.active_plates else 0.0
+        )
+        if not target.commit_fixed_placement(resolved.candidate):
+            raise RuntimeError(
+                "Fixed placement candidate could not be committed to its "
+                "unchanged target plate"
+            )
 
-        part = self.parts_pool[part_index]
-        self.packed_indices.add(part_index)
         reward = 0.0
-
-        part_w, part_h = part['w'], part['h']
-        if is_rotated == 1:
-            part_w, part_h = part_h, part_w
-
-        # ── 在所有 active_plates 中找最佳放置位置 ──
-        best_idx, best_score = -1, -float('inf')
-        for idx, plate in enumerate(self.active_plates):
-            sim = copy.deepcopy(plate)
-            ok, sx, sy, sw, sh, _ = sim.place_part(part_w, part_h, part['order_id'], strategy_id)
-            if ok:
-                score = sim.utilization - plate.utilization
-                if score > best_score:
-                    best_score, best_idx = score, idx
-
-        if best_idx != -1:
-            target   = self.active_plates[best_idx]
-            old_util = target.utilization
-            s, x, y, w, h, _ = target.place_part(part_w, part_h, part['order_id'], strategy_id)
-            if not s:
-                s, x, y, w, h, _ = target.place_part(part_w, part_h, part['order_id'], 2)
-            new_util = target.utilization
-
-            # 步奖励：利用率增量
-            reward += (new_util - old_util) * 15.0 * self.w_util
-        else:
-            # 开新板惩罚
-            last_util = self.active_plates[-1].utilization if self.active_plates else 0.0
+        if resolved.opens_new_plate:
+            self.active_plates.append(target)
             reward -= self.w_new_plate * (1.0 + (1.0 - last_util))
-
-            new_plate = PlateLayoutManager(width=self.plate_w, height=self.plate_h)
-            s, x, y, w, h, _ = new_plate.place_part(part_w, part_h, part['order_id'], strategy_id)
-            if s:
-                self.active_plates.append(new_plate)
-            else:
-                reward -= 2.0
+        else:
+            reward += (target.utilization - old_util) * 15.0 * self.w_util
+        self.packed_indices.add(resolved.part_index)
 
         terminated = len(self.packed_indices) == self.current_num_parts
         info = {}
@@ -333,53 +378,17 @@ class NestingSchedulingEnv(gym.Env):
     # ── Action Mask ──────────────────────────────────────────────────────────
 
     def _get_action_mask(self) -> np.ndarray:
-        total = self.max_capacity * 6
-        mask  = np.zeros(total, dtype=bool)
+        mask = np.zeros(self.action_space.n, dtype=bool)
 
         unpacked = [i for i in range(self.current_num_parts) if i not in self.packed_indices]
         if not unpacked:
-            return np.ones(total, dtype=bool)
+            return mask
 
-        # 1. 几何可行性检查
-        fittable = set()
-        for plate in self.active_plates:
-            if not plate.free_rects:
-                continue
-            mfw = max(r[2] for r in plate.free_rects)
-            mfh = max(r[3] for r in plate.free_rects)
-            for i in unpacked:
-                p = self.parts_pool[i]
-                if (p['w'] <= mfw and p['h'] <= mfh) or \
-                   (p['h'] <= mfw and p['w'] <= mfh):
-                    fittable.add(i)
-
-        # 2. 兜底候选
-        top_area = sorted(unpacked, key=lambda i: self.parts_pool[i]['area'], reverse=True)[:3]
-        top_due  = sorted(unpacked, key=lambda i: self.parts_pool[i]['due_date'])[:3]
-        candidates = fittable | set(top_area) | set(top_due)
-
-        # 3. 截取
-        if len(candidates) > self.max_mask_candidates:
-            plate_area = max(1.0, self.plate_w * self.plate_h)
-            safe_scale = max(1.0, self.episode_time_scale)
-
-            def priority_score(i):
-                p = self.parts_pool[i]
-                urgency = p['due_date'] / safe_scale
-                area_fit = p['area'] / plate_area
-                return urgency - area_fit * 0.5
-
-            guaranteed = set(top_area) | set(top_due)
-            remaining  = sorted(candidates - guaranteed, key=priority_score)
-            budget = self.max_mask_candidates - len(guaranteed)
-            candidates = guaranteed | set(remaining[:max(0, budget)])
-
-        # 4. 构建掩码
-        for i in candidates:
-            mask[i * 6: (i + 1) * 6] = True
-
-        if not mask.any():
-            for i in unpacked:
-                mask[i * 6: (i + 1) * 6] = True
+        for part_index in unpacked:
+            for rotation in range(self.NUM_ROTATIONS):
+                for strategy_id in range(self.NUM_STRATEGIES):
+                    action = self.encode_action(
+                        part_index, rotation, strategy_id)
+                    mask[action] = self._resolve_action(action) is not None
 
         return mask
