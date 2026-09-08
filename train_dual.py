@@ -10,10 +10,10 @@ Patch 2：环境边界和终局调度 rollout 由 integration wrappers 协调。
 训练流程：
   Phase 1: Nesting 预热（explicit EDD evaluator，通信向量全零）
   Phase 2: Scheduling 适应（nesting 冻结，scheduling 学习调度策略）
-  Phase 3: 联合微调（交替更新，联合终局奖励，通信梯度打通）
+  Phase 3: 顺序协同双智能体交替微调（无跨智能体梯度）
 """
 
-import os, shutil, datetime, math
+import os, shutil, datetime, math, json
 import numpy as np
 import torch
 import torch.nn as nn
@@ -29,7 +29,7 @@ from envs.packing_envs import NestingSchedulingEnv
 from envs.scheduling_env import SchedulingEnv
 from integration.scheduling_problem_provider import SchedulingProblemProviderWrapper
 from integration.scheduling_terminal_reward import SchedulingTerminalRewardWrapper
-from models.pointer_extractor import NestingModel
+from models.pointer_extractor import NestingModel, load_nesting_state_dict_strict
 from models.attention_extractor import AttentionFeatureExtractor
 from config import TRAIN_CONFIG
 from core.scheduling_observation import SchedulingObservationLayout
@@ -44,6 +44,8 @@ except ImportError:
 # 常量
 # ─────────────────────────────────────────────────────────────────────────────
 N_ACTIONS_PER  = 6                                     # 2旋转 × 3策略
+NESTING_CHECKPOINT_VERSION = 1
+PHASE3_PAIR_METADATA_VERSION = 1
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 工具
@@ -117,6 +119,48 @@ class NestingPPO:
     def set_lr(self, new_lr: float):
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = new_lr
+
+    def save_training_checkpoint(self, path, *, phase, round_id, learn_cycle=None):
+        """Save resumable agent state without serializing mutable environment state."""
+        payload = {
+            "format_version": NESTING_CHECKPOINT_VERSION,
+            "phase": phase,
+            "round": int(round_id),
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "total_steps": int(self.total_steps),
+        }
+        if learn_cycle is not None:
+            payload["learn_cycle"] = int(learn_cycle)
+        torch.save(payload, path)
+
+    def load_training_checkpoint(self, path, *, expected_phase=None,
+                                 expected_round=None, map_location=None):
+        """Restore model, optimizer, and counters from a resumable checkpoint."""
+        payload = torch.load(
+            path, map_location=map_location or self.device, weights_only=False)
+        required = {
+            "format_version", "phase", "round", "model_state_dict",
+            "optimizer_state_dict", "total_steps",
+        }
+        if not isinstance(payload, dict) or not required.issubset(payload):
+            raise ValueError(
+                "Nesting checkpoint is weights-only or legacy; a Patch 7 "
+                "resumable training checkpoint is required")
+        if payload["format_version"] != NESTING_CHECKPOINT_VERSION:
+            raise ValueError("Unsupported nesting training checkpoint version")
+        if expected_phase is not None and payload["phase"] != expected_phase:
+            raise ValueError(
+                f"Nesting checkpoint phase {payload['phase']!r} does not match "
+                f"expected phase {expected_phase!r}")
+        if expected_round is not None and int(payload["round"]) != int(expected_round):
+            raise ValueError(
+                f"Nesting checkpoint round {payload['round']} does not match "
+                f"expected round {expected_round}")
+        load_nesting_state_dict_strict(self.model, payload["model_state_dict"])
+        self.optimizer.load_state_dict(payload["optimizer_state_dict"])
+        self.total_steps = int(payload["total_steps"])
+        return payload
 
     def _to_tensor(self, x):
         return torch.as_tensor(x, dtype=torch.float32, device=self.device)
@@ -251,7 +295,8 @@ class NestingPPO:
 
         return float(np.mean(all_losses))
 
-    def learn(self, total_timesteps: int, save_path: str = None, tag: str = "nesting"):
+    def learn(self, total_timesteps: int, save_path: str = None, tag: str = "nesting",
+              checkpoint_phase=None, checkpoint_round=0):
         steps_done = 0
         cycle = 0
         while steps_done < total_timesteps:
@@ -262,9 +307,21 @@ class NestingPPO:
             print(f"[{tag}] cycle={cycle:4d}  steps={steps_done:7d}  "
                   f"mean_ep_r={mean_r:7.2f}  loss={loss:.4f}")
             if save_path and cycle % 10 == 0:
-                torch.save(self.model.state_dict(), f"{save_path}/{tag}_c{cycle}.pt")
+                checkpoint_path = f"{save_path}/{tag}_c{cycle}.pt"
+                if checkpoint_phase is None:
+                    torch.save(self.model.state_dict(), checkpoint_path)
+                else:
+                    self.save_training_checkpoint(
+                        checkpoint_path, phase=checkpoint_phase,
+                        round_id=checkpoint_round, learn_cycle=cycle)
         if save_path:
-            torch.save(self.model.state_dict(), f"{save_path}/{tag}_final.pt")
+            checkpoint_path = f"{save_path}/{tag}_final.pt"
+            if checkpoint_phase is None:
+                torch.save(self.model.state_dict(), checkpoint_path)
+            else:
+                self.save_training_checkpoint(
+                    checkpoint_path, phase=checkpoint_phase,
+                    round_id=checkpoint_round, learn_cycle=cycle)
 
     def predict(self, env: NestingSchedulingEnv, deterministic: bool = True):
         part_feats = env.get_part_feats()
@@ -336,6 +393,102 @@ class NestingModelPredictor:
         return action, None
 
 
+def start_fresh_scheduling_block(scheduling_model, scheduling_env):
+    """Use SB3's supported reset boundary before a new alternating block."""
+    bound_env = (scheduling_model.get_env()
+                 if hasattr(scheduling_model, "get_env") else None)
+    scheduling_model.set_env(bound_env or scheduling_env, force_reset=True)
+
+
+def set_phase3_nesting_lr(nesting_ppo, round_id, total_rounds,
+                          lr_start, lr_end):
+    progress = (int(round_id) - 1) / max(1, int(total_rounds) - 1)
+    cos_lr = lr_end + 0.5 * (lr_start - lr_end) * (
+        1.0 + math.cos(math.pi * progress))
+    nesting_ppo.set_lr(cos_lr)
+    return cos_lr
+
+
+def phase3_pair_paths(save_dir, round_id):
+    round_id = int(round_id)
+    return {
+        "nesting_checkpoint": os.path.join(
+            save_dir, f"nesting_joint_c{round_id}_final.pt"),
+        "scheduling_checkpoint": os.path.join(
+            save_dir, f"scheduling_joint_c{round_id}.zip"),
+        "metadata": os.path.join(save_dir, f"phase3_joint_c{round_id}.json"),
+    }
+
+
+def write_phase3_pair_metadata(save_dir, round_id):
+    paths = phase3_pair_paths(save_dir, round_id)
+    missing = [path for key, path in paths.items()
+               if key != "metadata" and not os.path.isfile(path)]
+    if missing:
+        raise FileNotFoundError(
+            f"Cannot record incomplete Phase 3 checkpoint pair: {missing}")
+    metadata = {
+        "format_version": PHASE3_PAIR_METADATA_VERSION,
+        "phase": "phase3",
+        "round": int(round_id),
+        "nesting_checkpoint": os.path.basename(paths["nesting_checkpoint"]),
+        "scheduling_checkpoint": os.path.basename(paths["scheduling_checkpoint"]),
+    }
+    with open(paths["metadata"], "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    return paths["metadata"]
+
+
+def load_phase3_pair_metadata(model_dir, round_id):
+    paths = phase3_pair_paths(model_dir, round_id)
+    if not os.path.isfile(paths["metadata"]):
+        raise FileNotFoundError(
+            f"Missing Phase 3 checkpoint-pair metadata: {paths['metadata']}")
+    with open(paths["metadata"], encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    expected = {
+        "format_version": PHASE3_PAIR_METADATA_VERSION,
+        "phase": "phase3",
+        "round": int(round_id),
+        "nesting_checkpoint": os.path.basename(paths["nesting_checkpoint"]),
+        "scheduling_checkpoint": os.path.basename(paths["scheduling_checkpoint"]),
+    }
+    if metadata != expected:
+        raise ValueError("Phase 3 checkpoint-pair metadata is inconsistent")
+    for key in ("nesting_checkpoint", "scheduling_checkpoint"):
+        resolved = os.path.join(model_dir, metadata[key])
+        if not os.path.isfile(resolved):
+            raise FileNotFoundError(
+                f"Incomplete Phase 3 checkpoint pair: missing {resolved}")
+    return metadata
+
+
+def train_phase1(nesting_ppo, terminal_env, steps, save_dir):
+    terminal_env.set_evaluator("edd")
+    nesting_ppo.learn(
+        steps * 10, save_path=save_dir, tag="nesting_phase1",
+        checkpoint_phase="phase1", checkpoint_round=0)
+
+
+def train_phase2(scheduling_model, scheduling_env, steps, save_dir):
+    start_fresh_scheduling_block(scheduling_model, scheduling_env)
+    scheduling_model.learn(steps * 10, reset_num_timesteps=False)
+    scheduling_model.save(f"{save_dir}/scheduling_phase2")
+
+
+def train_phase3_round(nesting_ppo, terminal_env, scheduling_model,
+                       scheduling_env, steps, save_dir, round_id):
+    terminal_env.set_evaluator("policy", scheduling_policy=scheduling_model)
+    nesting_ppo.learn(
+        steps, save_path=save_dir, tag=f"nesting_joint_c{round_id}",
+        checkpoint_phase="phase3", checkpoint_round=round_id)
+    start_fresh_scheduling_block(scheduling_model, scheduling_env)
+    scheduling_model.learn(steps, reset_num_timesteps=False)
+    scheduling_model.save(f"{save_dir}/scheduling_joint_c{round_id}")
+    write_phase3_pair_metadata(save_dir, round_id)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main — 三阶段训练，Phase 2+ 启用联合终局奖励
 # ─────────────────────────────────────────────────────────────────────────────
@@ -404,15 +557,11 @@ def main():
     # ── Phase 1：Nesting 预热 ─────────────────────────────────────────────
     # 显式使用 EDD terminal evaluator；这不是 policy rollout 的异常 fallback。
     print(f"\n{'='*60}\nPhase 1: Nesting Warm-up (explicit EDD terminal evaluation)\n{'='*60}")
-    nesting_ppo.learn(steps * 10, save_path=save_dir, tag="nesting_phase1")
+    train_phase1(nesting_ppo, terminal_nest_env, steps, save_dir)
 
     # ── Phase 2：Scheduling 适应 ──────────────────────────────────────────
     print(f"\n{'='*60}\nPhase 2: Scheduling Adaptation\n{'='*60}")
-    sched_model.learn(steps * 10, reset_num_timesteps=False)
-    sched_model.save(f"{save_dir}/scheduling_phase2")
-
-    # Phase 3 uses the current scheduling policy with the same stateless wrapper.
-    terminal_nest_env.set_evaluator("policy", scheduling_policy=sched_model)
+    train_phase2(sched_model, sched_env_masked, steps, save_dir)
 
     # ── Phase 3：联合微调（核心改进）─────────────────────────────────────
     # 启用联合终局奖励：Nesting 终局时调用真实 Scheduling agent
@@ -423,17 +572,13 @@ def main():
         print(f"\n===== Joint Cycle {c + 1}/{fine_tune_cycles} =====")
 
         # 余弦退火
-        progress = c / max(1, fine_tune_cycles - 1)
-        cos_lr = lr_end + 0.5 * (lr_start - lr_end) * (1.0 + math.cos(math.pi * progress))
-        nesting_ppo.set_lr(cos_lr)
+        cos_lr = set_phase3_nesting_lr(
+            nesting_ppo, c + 1, fine_tune_cycles, lr_start, lr_end)
         print(f"  Nesting LR: {cos_lr:.6f}")
 
-        # ── Nesting 训练：启用联合终局奖励 ──
-        nesting_ppo.learn(steps, save_path=save_dir, tag=f"nesting_joint_c{c+1}")
-
-        # ── Scheduling 训练 ──
-        sched_model.learn(steps, reset_num_timesteps=False)
-        sched_model.save(f"{save_dir}/scheduling_joint_c{c+1}")
+        train_phase3_round(
+            nesting_ppo, terminal_nest_env, sched_model,
+            sched_env_masked, steps, save_dir, c + 1)
 
     # 保存最终模型
     torch.save(nesting_model.state_dict(), f"{save_dir}/nesting_final.pt")

@@ -1,10 +1,8 @@
 import os
 import shutil
 import datetime
-from typing import Callable
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
-from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
 
 # 引入项目模块
 from envs.packing_envs import NestingSchedulingEnv
@@ -14,9 +12,17 @@ from integration.scheduling_terminal_reward import (
     SchedulingTerminalRewardWrapper,
     configure_terminal_evaluator_for_phase,
 )
-from custom_callbacks import TensorboardCallback, SnapshotCallback
 from config import TRAIN_CONFIG
-from core.nesting_observation import LEGACY_NESTING_SCHEMA_ERROR
+from models.pointer_extractor import NestingModel
+from train_dual import (
+    N_ACTIONS_PER,
+    NestingModelPredictor,
+    NestingPPO,
+    load_phase3_pair_metadata,
+    set_phase3_nesting_lr,
+    start_fresh_scheduling_block,
+    train_phase3_round,
+)
 
 # ================= 配置区域 (请修改这里) =================
 # 1. 上次中断的实验文件夹路径
@@ -26,10 +32,11 @@ PREV_EXP_DIR = "./experiments/exp_20260117_170916_resumed_from_c18"
 START_CYCLE = 22
 
 # 3. 总共要跑多少轮
-TOTAL_CYCLES = 50
+TOTAL_CYCLES = max(1, TRAIN_CONFIG["total_cycles"] - 20)
 
 # Explicit lifecycle selection; do not infer the evaluator from checkpoint files.
 RESUME_PHASE = "phase3"
+VALID_RESUME_PHASES = frozenset({"phase1", "phase2", "phase3"})
 
 
 # =======================================================
@@ -40,8 +47,8 @@ def mask_fn(env):
 
 def build_resume_nesting_env(resume_phase="phase1"):
     """Build the resume nesting env with an explicit lifecycle phase."""
-    if resume_phase not in {"phase1", "phase3"}:
-        raise ValueError("resume_phase must be 'phase1' or 'phase3'")
+    if resume_phase not in VALID_RESUME_PHASES:
+        raise ValueError("resume_phase must be 'phase1', 'phase2', or 'phase3'")
     nest_base = NestingSchedulingEnv()
     nest_terminal_env = SchedulingTerminalRewardWrapper(
         nest_base, evaluation_mode="edd",
@@ -53,17 +60,77 @@ def build_resume_nesting_env(resume_phase="phase1"):
 def configure_resume_terminal_evaluator(nesting_env, resume_phase, scheduling_model=None):
     """Apply the explicitly selected evaluator after checkpoints are loaded."""
     terminal_wrapper = nesting_env.env
+    evaluator_phase = "phase3" if resume_phase == "phase3" else "phase1"
     return configure_terminal_evaluator_for_phase(
-        terminal_wrapper, resume_phase, scheduling_policy=scheduling_model)
+        terminal_wrapper, evaluator_phase, scheduling_policy=scheduling_model)
 
 
-# 指数衰减调度器 (与 train_dual.py 保持一致)
-def exponential_schedule(start_lr: float, end_lr: float = 1e-5) -> Callable[[float], float]:
-    def func(progress_remaining: float) -> float:
-        current_progress = 1.0 - progress_remaining
-        return start_lr * (end_lr / start_lr) ** current_progress
+def build_resume_nesting_trainer(terminal_env, device="cpu"):
+    """Recreate the current custom Nesting trainer, not the legacy SB3 agent."""
+    layout = terminal_env.unwrapped.layout
+    model = NestingModel(
+        part_feat_dim=layout.part_dim,
+        state_feat_dim=layout.state_dim,
+        embed_dim=128,
+        n_heads=4,
+        n_enc_layers=2,
+        n_actions_per_part=N_ACTIONS_PER,
+        max_parts=layout.max_parts,
+        layout=layout,
+    )
+    return NestingPPO(
+        env=terminal_env,
+        model=model,
+        lr=TRAIN_CONFIG.get("lr_start", 3e-4),
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_eps=0.2,
+        ent_coef=0.02,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        n_steps=2048,
+        batch_size=256,
+        n_epochs=4,
+        device=device,
+    )
 
-    return func
+
+def build_isolated_scheduling_training(nesting_ppo):
+    """Use current Nesting weights with provider-owned mutable environment state."""
+    training_nesting_env = nesting_ppo.env.unwrapped
+    provider_nesting_env = NestingSchedulingEnv(
+        observation_layout=training_nesting_env.layout)
+    if provider_nesting_env is training_nesting_env:
+        raise RuntimeError("Scheduling provider must not reuse the Nesting training env")
+    provider_predictor = NestingModelPredictor(nesting_ppo, provider_nesting_env)
+    scheduling_base = SchedulingEnv()
+    provider = SchedulingProblemProviderWrapper(
+        scheduling_base, provider_nesting_env, provider_predictor)
+    return ActionMasker(provider, mask_fn), provider_nesting_env
+
+
+def run_resume_cycle(phase, nesting_ppo, terminal_env, scheduling_model,
+                     scheduling_env, steps, save_dir, round_id):
+    """Run only the agent updates belonging to the explicitly selected phase."""
+    if phase not in VALID_RESUME_PHASES:
+        raise ValueError("phase must be 'phase1', 'phase2', or 'phase3'")
+    if phase == "phase1":
+        terminal_env.set_evaluator("edd")
+        nesting_ppo.learn(
+            steps, save_path=save_dir, tag=f"nesting_phase1_resumed_c{round_id}",
+            checkpoint_phase="phase1", checkpoint_round=0)
+        return
+    if scheduling_model is None or scheduling_env is None:
+        raise ValueError(f"{phase} resume requires a scheduling model and env")
+    if phase == "phase2":
+        start_fresh_scheduling_block(scheduling_model, scheduling_env)
+        scheduling_model.learn(steps, reset_num_timesteps=False)
+        scheduling_model.save(
+            f"{save_dir}/scheduling_phase2_resumed_c{round_id}")
+        return
+    train_phase3_round(
+        nesting_ppo, terminal_env, scheduling_model, scheduling_env,
+        steps, save_dir, round_id)
 
 
 def setup_resume_experiment():
@@ -99,96 +166,73 @@ def setup_resume_experiment():
     return log_n, log_s, save_dir
 
 
+def resolve_resume_checkpoints(model_dir, phase, last_completed_round):
+    """Resolve only authoritative current-mainline checkpoint names."""
+    if phase not in VALID_RESUME_PHASES:
+        raise ValueError("phase must be 'phase1', 'phase2', or 'phase3'")
+    if phase == "phase3":
+        metadata = load_phase3_pair_metadata(model_dir, last_completed_round)
+        return (
+            os.path.join(model_dir, metadata["nesting_checkpoint"]),
+            os.path.join(model_dir, metadata["scheduling_checkpoint"]),
+            "phase3",
+            int(last_completed_round),
+        )
+
+    nesting_path = os.path.join(model_dir, "nesting_phase1_final.pt")
+    scheduling_path = None
+    if phase == "phase2":
+        scheduling_path = os.path.join(model_dir, "scheduling_phase2.zip")
+    required = [nesting_path] + ([scheduling_path] if scheduling_path else [])
+    missing = [path for path in required if not os.path.isfile(path)]
+    if missing:
+        raise FileNotFoundError(
+            f"Missing authoritative {phase} resume checkpoint(s): {missing}")
+    return nesting_path, scheduling_path, "phase1", 0
+
+
 def main():
-    # 1. 检查旧模型是否存在
+    if RESUME_PHASE not in VALID_RESUME_PHASES:
+        raise ValueError("RESUME_PHASE must be 'phase1', 'phase2', or 'phase3'")
     prev_model_dir = os.path.join(PREV_EXP_DIR, "models")
-    last_completed_cycle = START_CYCLE - 1
+    last_completed_round = START_CYCLE - 1
+    nest_path, sched_path, checkpoint_phase, checkpoint_round = (
+        resolve_resume_checkpoints(
+            prev_model_dir, RESUME_PHASE, last_completed_round))
 
-    nest_path = os.path.join(prev_model_dir, f"nesting_c{last_completed_cycle}.zip")
-    sched_path = os.path.join(prev_model_dir, f"scheduling_c{last_completed_cycle}.zip")
-
-    if not os.path.exists(nest_path) or not os.path.exists(sched_path):
-        print(f"❌ 错误：找不到第 {last_completed_cycle} 轮的模型文件！")
-        print(f"   检查路径: {nest_path}")
-        return
-
-    # 2. 初始化新实验路径
     log_n, log_s, save_dir = setup_resume_experiment()
 
-    # 3. 初始化环境 (使用修复后的最新代码)
-    # 这里的环境已经包含了最新的防崩逻辑
     print("⏳ 初始化环境...")
-    nest_env = build_resume_nesting_env(RESUME_PHASE)
+    wrapped_nest_env = build_resume_nesting_env(RESUME_PHASE)
+    terminal_nest_env = wrapped_nest_env.env
+    nesting_ppo = build_resume_nesting_trainer(terminal_nest_env, device="cpu")
+    nesting_ppo.load_training_checkpoint(
+        nest_path, expected_phase=checkpoint_phase,
+        expected_round=checkpoint_round, map_location="cpu")
 
-    sched_base = SchedulingEnv()
-
-    # 4. 加载旧模型
-    print(f"🔥 加载旧模型 (Cycle {last_completed_cycle})...")
-
-    # 重新定义 LR Schedule，防止加载旧模型时由 pickle 问题导致报错
-    lr_start = TRAIN_CONFIG.get('lr_start', 1e-3)
-    lr_end = TRAIN_CONFIG.get('lr_end', 1e-5)
-
-    custom_objects = {
-        "learning_rate": exponential_schedule(lr_start, lr_end),
-        "lr_schedule": exponential_schedule(lr_start, lr_end),
-        # 也可以在这里覆盖其他参数，比如 clip_range
-        "clip_range": 0.1,
-        "max_grad_norm": 0.3
-    }
-
-    # 加载 Nesting
-    try:
-        nest_model = MaskablePPO.load(
-            nest_path,
-            env=nest_env,  # 绑定新环境
-            custom_objects=custom_objects,
-            tensorboard_log=log_n,  # 指向新日志目录
-            print_system_info=True
-        )
-    except ValueError as exc:
-        if "Observation spaces do not match" in str(exc):
-            raise ValueError(LEGACY_NESTING_SCHEMA_ERROR) from exc
-        raise
-
-    sched_env = ActionMasker(
-        SchedulingProblemProviderWrapper(sched_base, nest_env, nest_model), mask_fn)
-
-    # 加载 Scheduling
-    sched_model = MaskablePPO.load(
-        sched_path,
-        env=sched_env,
-        custom_objects=custom_objects,
-        tensorboard_log=log_s,
-        # 🟢 新增：强制 CPU 运行以获得更详细的报错（如果有），并且重置优化器状态
-        device="cpu",
-        force_reset=True
-    )
+    scheduling_model = scheduling_env = None
+    if RESUME_PHASE in {"phase2", "phase3"}:
+        scheduling_env, _ = build_isolated_scheduling_training(nesting_ppo)
+        scheduling_model = MaskablePPO.load(
+            sched_path, env=scheduling_env, tensorboard_log=log_s,
+            device="cpu", force_reset=True)
     configure_resume_terminal_evaluator(
-        nest_env, RESUME_PHASE, scheduling_model=sched_model)
-    # 5. 回调
-    cb = CallbackList([
-        CheckpointCallback(50000, save_dir, name_prefix="nest"),
-        TensorboardCallback(),
-        SnapshotCallback(20000, log_n)
-    ])
+        wrapped_nest_env, RESUME_PHASE,
+        scheduling_model=scheduling_model)
 
-    # 7. 续训循环
     steps = TRAIN_CONFIG['steps_per_cycle']
     print(f"🚀 开始续训: Cycle {START_CYCLE} -> {TOTAL_CYCLES}")
 
     for c in range(START_CYCLE, TOTAL_CYCLES + 1):
         print(f"\n===== Cycle {c}/{TOTAL_CYCLES} (Resumed) =====")
-
-        # 训练 Nesting
-        print(">>> Training Nesting...")
-        nest_model.learn(steps, reset_num_timesteps=False, callback=cb)
-        nest_model.save(f"{save_dir}/nesting_c{c}")
-
-        # 训练 Scheduling
-        print(">>> Training Scheduling...")
-        sched_model.learn(steps, reset_num_timesteps=False)
-        sched_model.save(f"{save_dir}/scheduling_c{c}")
+        if RESUME_PHASE == "phase3":
+            set_phase3_nesting_lr(
+                nesting_ppo, c, TOTAL_CYCLES,
+                TRAIN_CONFIG.get("lr_start", 3e-4),
+                TRAIN_CONFIG.get("lr_end", 1e-5))
+        run_resume_cycle(
+            RESUME_PHASE, nesting_ppo, terminal_nest_env,
+            scheduling_model, scheduling_env, steps, save_dir, c)
 
     print("✅ 续训全部完成！")
 

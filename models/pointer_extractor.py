@@ -21,6 +21,8 @@ LEGACY_NESTING_CHECKPOINT_ERROR = LEGACY_NESTING_SCHEMA_ERROR
 
 def load_nesting_state_dict_strict(model: nn.Module, state_dict) -> None:
     """Load a Patch-5 nesting checkpoint without partial compatibility tricks."""
+    if "model_state_dict" in state_dict:
+        state_dict = state_dict["model_state_dict"]
     first_weight = state_dict.get("encoder.item_embed.0.weight")
     if first_weight is not None and first_weight.shape[1] != model.layout.part_dim:
         raise ValueError(LEGACY_NESTING_CHECKPOINT_ERROR)
