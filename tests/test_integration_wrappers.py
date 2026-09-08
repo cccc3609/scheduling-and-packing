@@ -68,10 +68,9 @@ def test_terminal_wrapper_uses_fresh_env_and_fails_fast():
     live_training_env = SchedulingEnv(num_machines=1, max_tasks=4)
     wrapper = SchedulingTerminalRewardWrapper(TerminalBase(), NestingPolicy())
     _, reward_1, done, _, _ = wrapper.step(0)
-    ema_after_first = wrapper.reward_transform._cost_ema
-    _, reward_2, _, _, _ = wrapper.step(0)
-    assert done and reward_1 == pytest.approx(reward_2)
-    assert wrapper.reward_transform._cost_ema == ema_after_first
+    assert done
+    with pytest.raises(RuntimeError, match="already been settled"):
+        wrapper.step(0)
     assert wrapper.last_evaluator_id != id(live_training_env)
 
     class FailingPolicy:

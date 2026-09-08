@@ -10,7 +10,7 @@ from models.sched_policy_loader import load_scheduling_policy
 
 from envs.packing_envs import NestingSchedulingEnv
 from envs.scheduling_env import SchedulingEnv
-from integration.scheduling_terminal_reward import SchedulingTerminalRewardWrapper
+from integration.scheduling_terminal_reward import make_dual_agent_terminal_wrapper
 from models.pointer_extractor import NestingModel, load_nesting_state_dict_strict
 from heuristic.blf_skyline_maxrects import PlateLayoutManager
 from heuristic.scheduler import SchedulerStateMachine
@@ -451,7 +451,8 @@ def main():
         sched_model = load_scheduling_policy(sched_zip, device=device)
         print(f"[INFO] Scheduling 模型加载完成: {os.path.basename(sched_zip)}")
     else:
-        print("[WARN] 未找到 Scheduling 模型，排样将不感知调度信息")
+        raise FileNotFoundError(
+            "Dual-Agent RL evaluation requires a scheduling policy checkpoint")
 
     # ── 2. 固定测试数据 ─────────────────────────────────────────────────────────
     TEST_N, TEST_W, TEST_H = 60, 200, 200
@@ -461,8 +462,7 @@ def main():
 
     # ── 3. RL 推理 ─────────────────────────────────────────────────────────────
     print("\n[Player 1] Dual-Agent RL ...")
-    rl_evaluator = SchedulingTerminalRewardWrapper(
-        rl_env, evaluation_mode="edd")
+    rl_evaluator = make_dual_agent_terminal_wrapper(rl_env, sched_model)
     run_rl_episode(
         rl_evaluator, nest_model, device=device,
         seed=SEED,

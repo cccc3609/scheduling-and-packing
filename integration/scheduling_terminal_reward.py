@@ -77,20 +77,11 @@ class SchedulingEvaluator:
 
 
 class TerminalRewardTransform:
-    """The original JointRewardCalculator EMA/tanh transform, without env state."""
-
-    def __init__(self):
-        self._cost_ema = None
-        self._ema_alpha = 0.1
+    """Stateless monotone transform from formal cost ratio to terminal reward."""
 
     def to_reward(self, cost_dict, w_terminal=10.0):
         penalty_ratio = cost_dict["penalty_ratio"]
-        if self._cost_ema is None:
-            self._cost_ema = penalty_ratio
-        else:
-            self._cost_ema = self._ema_alpha * penalty_ratio + (1 - self._ema_alpha) * self._cost_ema
-        advantage = -(penalty_ratio - self._cost_ema)
-        scaled = w_terminal * math.tanh(advantage * 2.0)
+        scaled = -w_terminal * math.tanh(2.0 * penalty_ratio)
         return float(np.clip(scaled, -w_terminal * 2, w_terminal * 2))
 
 
@@ -112,6 +103,11 @@ class SchedulingTerminalRewardWrapper(gym.Wrapper):
         )
         self.reward_transform = TerminalRewardTransform()
         self.cost_function = GlobalCostFunction()
+        self._terminal_settled = False
+
+    def reset(self, **kwargs):
+        self._terminal_settled = False
+        return self.env.reset(**kwargs)
 
     @property
     def evaluation_mode(self):
@@ -149,9 +145,15 @@ class SchedulingTerminalRewardWrapper(gym.Wrapper):
         return self.scheduling_evaluator.evaluate(problem, nesting_context)
 
     def step(self, action):
+        if self._terminal_settled:
+            raise RuntimeError(
+                "Terminal scheduling evaluation has already been settled; "
+                "reset the wrapper before calling step again"
+            )
         obs, reward, terminated, truncated, info = self.env.step(action)
         if not (terminated or truncated) or "terminal_result" not in info:
             return obs, reward, terminated, truncated, info
+        self._terminal_settled = True
         result = info["terminal_result"]
         problem = build_scheduling_problem(result.instance, result.plates)
         nesting_context = build_nesting_context(result.instance, result.plates)
@@ -172,9 +174,39 @@ class SchedulingTerminalRewardWrapper(gym.Wrapper):
             "cost_material": cost["cost_material"], "cost_jit": cost["cost_jit"],
             "cost_total": cost["cost_total"], "utilization": cost["utilization"],
             "plate_count": cost["plate_count"], "total_delay": cost["total_delay"],
-            "late_count": cost["late_count"],
+            "late_count": cost["late_count"], "penalty_ratio": cost["penalty_ratio"],
             "norm_reward": terminal_reward,
         }
         info["episode_metrics"] = base._compute_metrics()
         info["cost_metrics"] = dict(base.cost_metrics)
         return obs, reward, terminated, truncated, info
+
+
+def make_dual_agent_terminal_wrapper(
+    env, scheduling_policy, scheduling_env_factory=None,
+):
+    """Build an explicitly policy-conditioned dual-agent evaluator."""
+    if scheduling_policy is None:
+        raise ValueError("Dual-Agent evaluation requires a scheduling policy")
+    return SchedulingTerminalRewardWrapper(
+        env,
+        scheduling_policy=scheduling_policy,
+        scheduling_env_factory=scheduling_env_factory,
+        evaluation_mode="policy",
+    )
+
+
+def configure_terminal_evaluator_for_phase(
+    terminal_wrapper, phase, scheduling_policy=None,
+):
+    """Configure an explicit training/resume evaluator lifecycle."""
+    if phase == "phase1":
+        terminal_wrapper.set_evaluator("edd")
+    elif phase == "phase3":
+        if scheduling_policy is None:
+            raise ValueError("phase3 requires a scheduling policy")
+        terminal_wrapper.set_evaluator(
+            "policy", scheduling_policy=scheduling_policy)
+    else:
+        raise ValueError("phase must be 'phase1' or 'phase3'")
+    return terminal_wrapper

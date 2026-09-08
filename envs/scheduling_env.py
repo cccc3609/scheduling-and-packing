@@ -190,20 +190,19 @@ class SchedulingEnv(gym.Env):
         return np.clip(np.nan_to_num(obs, nan=0.0, posinf=5.0, neginf=-5.0), -5.0, 5.0)
 
     def step(self, action):
+        if not self.action_space.contains(action):
+            raise ValueError(f"Scheduling action {action!r} is outside the action space")
         action = int(action)
+        if not bool(self._get_action_mask()[action]):
+            raise ValueError(
+                f"Scheduling action {action} violates the current action mask")
         t_idx, m_idx = action // self.num_machines, action % self.num_machines
-
-        # 修复：非法动作惩罚从 -10 降为 -2
-        if t_idx >= len(self.task_pool) or self.scheduled_mask[t_idx]:
-            return self._get_obs(), -2.0, True, False, {}
 
         task = self.task_pool[t_idx]
         curr = self.machine_times[m_idx]
 
-        # lazy start 仅在所有机器繁忙时生效
-        min_t    = np.min(self.machine_times)
-        all_busy = bool(np.all(self.machine_times > min_t + 1e-6))
-        start = max(curr, task['due'] - task['cut']) if all_busy else curr
+        # Formal scheduling model: non-delay parallel-machine scheduling.
+        start = curr
 
         end = start + task['cut']
         self.machine_times[m_idx] = end
@@ -214,14 +213,8 @@ class SchedulingEnv(gym.Env):
                 self.orders_snapshot[oid]['finished_time'] = max(
                     self.orders_snapshot[oid]['finished_time'], end)
 
-        # ── 步奖励：负载均衡 + 交期感知 ──
-        scale = max(10.0, self.episode_time_scale)
-        # 1) 机器负载均衡：std 越小越好
-        reward = -float(np.std(self.machine_times)) / scale * 0.5
-
-        # 2) 选择最空闲机器的奖励（鼓励负载均衡）
-        if m_idx == int(np.argmin(self.machine_times)):
-            reward += 0.1
+        # Scheduling PPO optimizes the formal order-level JIT proxy only.
+        reward = 0.0
 
         valid  = len(self.task_pool)
         done   = bool(np.sum(self.scheduled_mask[:valid]) == valid)

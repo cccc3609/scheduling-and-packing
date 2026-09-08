@@ -1,6 +1,8 @@
 """Canonical material and just-in-time cost implementation."""
 
 from collections.abc import Mapping
+import math
+from numbers import Real
 from typing import Any
 
 from config import COST_CONFIG
@@ -68,6 +70,16 @@ class GlobalCostFunction:
         missing_orders = set(orders).difference(order_finish_times)
         if missing_orders:
             raise ValueError(f"Missing finish times for orders: {sorted(missing_orders)}")
+        nonfinite_orders = [
+            order_id for order_id in orders
+            if not isinstance(order_finish_times[order_id], Real)
+            or not math.isfinite(float(order_finish_times[order_id]))
+        ]
+        if nonfinite_orders:
+            raise ValueError(
+                "Finish times must be finite numeric values for orders: "
+                f"{sorted(nonfinite_orders)}"
+            )
 
         final_plates = [plate for plate in plates if plate.placed_parts]
         total_part_area = sum(float(part["area"]) for part in parts_pool)

@@ -12,7 +12,10 @@ from tqdm import tqdm
 from models.sched_policy_loader import load_scheduling_policy
 
 from envs.packing_envs import NestingSchedulingEnv
-from integration.scheduling_terminal_reward import SchedulingTerminalRewardWrapper
+from integration.scheduling_terminal_reward import (
+    SchedulingTerminalRewardWrapper,
+    make_dual_agent_terminal_wrapper,
+)
 from models.pointer_extractor import NestingModel, load_nesting_state_dict_strict
 from heuristic.blf_skyline_maxrects import PlateLayoutManager
 from heuristic.scheduler import SchedulerStateMachine
@@ -110,10 +113,16 @@ def run_rl_episode(
     seed: int,
     num_parts: int,
     plate_size: tuple,
+    evaluation_mode: str = "policy",
 ) -> NestingSchedulingEnv:
     """每局创建新环境，避免状态污染。"""
     base_env = NestingSchedulingEnv(observation_layout=model.layout)
-    env = SchedulingTerminalRewardWrapper(base_env, evaluation_mode="edd")
+    if evaluation_mode == "policy":
+        env = make_dual_agent_terminal_wrapper(base_env, sched_model)
+    elif evaluation_mode == "edd":
+        env = SchedulingTerminalRewardWrapper(base_env, evaluation_mode="edd")
+    else:
+        raise ValueError("evaluation_mode must be 'policy' or 'edd'")
     obs, _ = env.reset(
         seed=seed,
         options={"num_parts": num_parts, "plate_size": plate_size},
@@ -322,6 +331,9 @@ def main():
     sched_model = None
     if sched_zip and os.path.exists(sched_zip + ".zip"):
         sched_model = load_scheduling_policy(sched_zip, device=device)
+    else:
+        raise FileNotFoundError(
+            "Dual-Agent RL generalization evaluation requires a scheduling checkpoint")
         print(f"[INFO] Scheduling 模型: {os.path.basename(sched_zip)}")
 
     report_dir = os.path.join(exp_dir, "generalization_report")

@@ -12,8 +12,8 @@ plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'Arial']
 plt.rcParams['axes.unicode_minus'] = False
 
 # 🔴 这里填你日志里的确切名字 (根据 custom_callbacks.py)
-KEY_UTIL = 'Physical/Raw_Avg_Util'
-KEY_JIT = 'Physical/Raw_Avg_JIT'
+KEY_UTIL = 'Physical/Utilization'
+KEY_JIT = 'Economy/JIT_Cost'
 
 
 def read_tb(log_dir):

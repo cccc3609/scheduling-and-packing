@@ -335,7 +335,7 @@ def test_evaluation_reencodes_parts_each_decision(runner):
     if runner is run_batch_episode:
         runner(model_env, model, seed=9, options={"num_parts": 2})
     else:
-        runner(model, None, "cpu", 9, 2, (200, 200))
+        runner(model, None, "cpu", 9, 2, (200, 200), evaluation_mode="edd")
     assert len(model.decision_inputs) == 2
     assert not torch.equal(model.decision_inputs[0], model.decision_inputs[1])
 

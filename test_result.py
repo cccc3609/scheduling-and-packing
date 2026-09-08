@@ -11,10 +11,8 @@ from sb3_contrib.common.wrappers import ActionMasker
 
 # 引入项目模块
 from envs.packing_envs import NestingSchedulingEnv
-from envs.scheduling_env import SchedulingEnv
-from integration.scheduling_terminal_reward import SchedulingTerminalRewardWrapper
-from models.attention_extractor import AttentionFeatureExtractor
-from config import COST_CONFIG, TRAIN_CONFIG
+from integration.scheduling_terminal_reward import make_dual_agent_terminal_wrapper
+from config import COST_CONFIG
 from core.nesting_observation import validate_nesting_checkpoint_observation_space
 
 # 配置字体
@@ -222,18 +220,16 @@ def main():
     nest_path, sched_path, exp_dir = find_latest_experiment_models()
     if not nest_path: return
 
-    # 初始化环境
+    # Initialize the base environment; bind the policy evaluator after loading.
     nest_base = NestingSchedulingEnv()
-    nest_terminal_env = SchedulingTerminalRewardWrapper(
-        nest_base, evaluation_mode="edd")
-    nest_env = ActionMasker(nest_terminal_env, mask_fn)
-    sched_env = SchedulingEnv()
-    sched_env = ActionMasker(sched_env, mask_fn)
 
     print("Loading Models...")
     nest_model = MaskablePPO.load(nest_path)
     validate_nesting_checkpoint_observation_space(nest_model)
     sched_model = MaskablePPO.load(sched_path)
+    nest_terminal_env = make_dual_agent_terminal_wrapper(
+        nest_base, sched_model)
+    nest_env = ActionMasker(nest_terminal_env, mask_fn)
 
     print("Generating Visualization...")
 

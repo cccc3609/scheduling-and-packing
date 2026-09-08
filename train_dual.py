@@ -8,7 +8,7 @@ train_dual.py  —  协同优化训练循环
 Patch 2：环境边界和终局调度 rollout 由 integration wrappers 协调。
 
 训练流程：
-  Phase 1: Nesting 预热（EDD fallback，通信向量全零）
+  Phase 1: Nesting 预热（explicit EDD evaluator，通信向量全零）
   Phase 2: Scheduling 适应（nesting 冻结，scheduling 学习调度策略）
   Phase 3: 联合微调（交替更新，联合终局奖励，通信梯度打通）
 """
@@ -411,7 +411,7 @@ def main():
     sched_model.learn(steps * 10, reset_num_timesteps=False)
     sched_model.save(f"{save_dir}/scheduling_phase2")
 
-    # Phase 3 使用当前 scheduling policy；保留同一个 wrapper 和 EMA transform。
+    # Phase 3 uses the current scheduling policy with the same stateless wrapper.
     terminal_nest_env.set_evaluator("policy", scheduling_policy=sched_model)
 
     # ── Phase 3：联合微调（核心改进）─────────────────────────────────────

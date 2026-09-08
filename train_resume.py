@@ -10,7 +10,10 @@ from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList
 from envs.packing_envs import NestingSchedulingEnv
 from envs.scheduling_env import SchedulingEnv
 from integration.scheduling_problem_provider import SchedulingProblemProviderWrapper
-from integration.scheduling_terminal_reward import SchedulingTerminalRewardWrapper
+from integration.scheduling_terminal_reward import (
+    SchedulingTerminalRewardWrapper,
+    configure_terminal_evaluator_for_phase,
+)
 from custom_callbacks import TensorboardCallback, SnapshotCallback
 from config import TRAIN_CONFIG
 from core.nesting_observation import LEGACY_NESTING_SCHEMA_ERROR
@@ -25,6 +28,9 @@ START_CYCLE = 22
 # 3. 总共要跑多少轮
 TOTAL_CYCLES = 50
 
+# Explicit lifecycle selection; do not infer the evaluator from checkpoint files.
+RESUME_PHASE = "phase3"
+
 
 # =======================================================
 
@@ -32,12 +38,23 @@ def mask_fn(env):
     return env.get_wrapper_attr("_get_action_mask")()
 
 
-def build_resume_nesting_env():
-    """Restore the pre-Patch-2 resume terminal semantics via explicit EDD."""
+def build_resume_nesting_env(resume_phase="phase1"):
+    """Build the resume nesting env with an explicit lifecycle phase."""
+    if resume_phase not in {"phase1", "phase3"}:
+        raise ValueError("resume_phase must be 'phase1' or 'phase3'")
     nest_base = NestingSchedulingEnv()
     nest_terminal_env = SchedulingTerminalRewardWrapper(
-        nest_base, evaluation_mode="edd")
+        nest_base, evaluation_mode="edd",
+        scheduling_env_factory=SchedulingEnv)
+    nest_terminal_env.resume_phase = resume_phase
     return ActionMasker(nest_terminal_env, mask_fn)
+
+
+def configure_resume_terminal_evaluator(nesting_env, resume_phase, scheduling_model=None):
+    """Apply the explicitly selected evaluator after checkpoints are loaded."""
+    terminal_wrapper = nesting_env.env
+    return configure_terminal_evaluator_for_phase(
+        terminal_wrapper, resume_phase, scheduling_policy=scheduling_model)
 
 
 # 指数衰减调度器 (与 train_dual.py 保持一致)
@@ -101,7 +118,7 @@ def main():
     # 3. 初始化环境 (使用修复后的最新代码)
     # 这里的环境已经包含了最新的防崩逻辑
     print("⏳ 初始化环境...")
-    nest_env = build_resume_nesting_env()
+    nest_env = build_resume_nesting_env(RESUME_PHASE)
 
     sched_base = SchedulingEnv()
 
@@ -147,6 +164,8 @@ def main():
         device="cpu",
         force_reset=True
     )
+    configure_resume_terminal_evaluator(
+        nest_env, RESUME_PHASE, scheduling_model=sched_model)
     # 5. 回调
     cb = CallbackList([
         CheckpointCallback(50000, save_dir, name_prefix="nest"),

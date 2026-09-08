@@ -84,7 +84,9 @@ def test_phase1_explicit_edd_does_not_call_random_policy_and_keeps_reward():
 
     assert terminated and not truncated
     assert policy.predict_calls == 0
-    assert reward == pytest.approx(1.25)  # first EMA-adjusted terminal reward is zero
+    expected_terminal = -10.0 * np.tanh(
+        2.0 * info["cost_metrics"]["penalty_ratio"])
+    assert reward == pytest.approx(1.25 + expected_terminal)
     assert wrapper.evaluation_mode == "edd"
     assert info["cost_metrics"]["cost_total"] > 0.0
     assert "norm_reward" in info["cost_metrics"]
