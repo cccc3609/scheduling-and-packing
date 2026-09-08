@@ -13,19 +13,16 @@ from models.sched_policy_loader import load_scheduling_policy
 
 from envs.packing_envs import NestingSchedulingEnv
 from integration.scheduling_terminal_reward import SchedulingTerminalRewardWrapper
-from models.pointer_extractor import NestingModel
+from models.pointer_extractor import NestingModel, load_nesting_state_dict_strict
 from heuristic.blf_skyline_maxrects import PlateLayoutManager
 from heuristic.scheduler import SchedulerStateMachine
-from config import TEST_SCENARIOS, MAX_PARTS_CAPACITY
+from config import TEST_SCENARIOS
 from core.cost import GlobalCostFunction
 from core.processing import plate_processing_time
 
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial']
 plt.rcParams['axes.unicode_minus'] = False
 
-PART_FEAT_DIM  = NestingSchedulingEnv.PART_FEAT_DIM
-STATE_FEAT_DIM = NestingSchedulingEnv.STATE_FEAT_DIM
-MAX_PARTS      = MAX_PARTS_CAPACITY
 N_ACTIONS_PER  = 6
 NUM_EPISODES   = 20   # 每场景跑多少局
 
@@ -85,15 +82,17 @@ def find_latest_models(exp_root: str = "./experiments"):
     return None, None, None
 
 
-def load_nesting_model(pt_path: str, device: str = "cpu") -> NestingModel:
+def load_nesting_model(pt_path: str, layout, device: str = "cpu") -> NestingModel:
     model = NestingModel(
-        part_feat_dim=PART_FEAT_DIM,
-        state_feat_dim=STATE_FEAT_DIM,
+        part_feat_dim=layout.part_dim,
+        state_feat_dim=layout.state_dim,
         embed_dim=128, n_heads=4, n_enc_layers=2,
         n_actions_per_part=N_ACTIONS_PER,
-        max_parts=MAX_PARTS,
+        max_parts=layout.max_parts,
+        layout=layout,
     ).to(device)
-    model.load_state_dict(torch.load(pt_path, map_location=device))
+    load_nesting_state_dict_strict(
+        model, torch.load(pt_path, map_location=device))
     model.eval()
     print(f"[INFO] Nesting 模型: {os.path.basename(pt_path)}")
     return model
@@ -113,25 +112,23 @@ def run_rl_episode(
     plate_size: tuple,
 ) -> NestingSchedulingEnv:
     """每局创建新环境，避免状态污染。"""
-    base_env = NestingSchedulingEnv()
+    base_env = NestingSchedulingEnv(observation_layout=model.layout)
     env = SchedulingTerminalRewardWrapper(base_env, evaluation_mode="edd")
     obs, _ = env.reset(
         seed=seed,
         options={"num_parts": num_parts, "plate_size": plate_size},
     )
 
-    pf = torch.as_tensor(
-        env.get_part_feats(), dtype=torch.float32, device=device
-    ).unsqueeze(0)
-    H = model.encode_parts(pf)
-
     done = False
     while not done:
+        pf = torch.as_tensor(
+            env.get_part_feats(), dtype=torch.float32, device=device
+        ).unsqueeze(0)
         sf   = torch.as_tensor(env.get_state_feat(),
                                dtype=torch.float32, device=device).unsqueeze(0)
         mask = torch.as_tensor(env._get_action_mask(),
                                dtype=torch.bool, device=device).unsqueeze(0)
-        logits, _ = model.decode_step(sf, H, mask)
+        logits, _ = model.forward_decision(pf, sf, mask)
         action = int(logits.argmax(dim=-1).item())
         obs, _, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
@@ -320,7 +317,8 @@ def main():
     if not nest_pt:
         return
 
-    nest_model  = load_nesting_model(nest_pt, device)
+    runtime_env = NestingSchedulingEnv()
+    nest_model  = load_nesting_model(nest_pt, runtime_env.layout, device)
     sched_model = None
     if sched_zip and os.path.exists(sched_zip + ".zip"):
         sched_model = load_scheduling_policy(sched_zip, device=device)

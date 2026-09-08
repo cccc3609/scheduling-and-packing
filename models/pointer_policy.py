@@ -15,6 +15,9 @@ from sb3_contrib.common.maskable.policies import MaskableActorCriticPolicy
 from sb3_contrib.common.maskable.distributions import MaskableCategoricalDistribution
 from stable_baselines3.common.type_aliases import Schedule
 from models.pointer_extractor import PartEncoder, StepDecoder, PointerActorHead
+from core.nesting_observation import (
+    LEGACY_NESTING_SCHEMA_ERROR, NestingObservationLayout,
+)
 
 _NEG_INF = -1e9
 
@@ -26,22 +29,31 @@ class PointerFeatureExtractor(nn.Module):
     """
 
     def __init__(self, observation_space, features_dim=128,
-                 item_dim=5, global_prefix_dim=0,
+                 item_dim=None, global_prefix_dim=0,
                  embed_dim=128, n_heads=4, n_layers=2,
-                 max_parts=120, state_feat_dim=57):
+                 max_parts=None, state_feat_dim=None, layout=None):
         super().__init__()
-        self.item_dim = item_dim
-        self.max_parts = max_parts
-        self.state_feat_dim = state_feat_dim
+        self.layout = layout or NestingObservationLayout()
+        item_dim = self.layout.part_dim if item_dim is None else item_dim
+        max_parts = self.layout.max_parts if max_parts is None else max_parts
+        state_feat_dim = self.layout.state_dim if state_feat_dim is None else state_feat_dim
+        if (item_dim, max_parts, state_feat_dim) != (
+                self.layout.part_dim, self.layout.max_parts, self.layout.state_dim):
+            raise ValueError("PointerFeatureExtractor dimensions must match its layout")
+        if observation_space.shape != (self.layout.obs_dim,):
+            self.layout.validate_observation_width(observation_space.shape[-1])
+        self.item_dim = self.layout.part_dim
+        self.max_parts = self.layout.max_parts
+        self.state_feat_dim = self.layout.state_dim
         self.embed_dim = embed_dim
 
         self.part_encoder = PartEncoder(
             part_feat_dim=item_dim, embed_dim=embed_dim,
-            n_heads=n_heads, n_layers=n_layers
+            n_heads=n_heads, n_layers=n_layers, layout=self.layout
         )
         self.step_decoder = StepDecoder(
             state_feat_dim=state_feat_dim, embed_dim=embed_dim,
-            n_heads=n_heads
+            n_heads=n_heads, layout=self.layout
         )
         # features_dim 用于 SB3 兼容
         self._features_dim = features_dim
@@ -54,14 +66,17 @@ class PointerFeatureExtractor(nn.Module):
         """
         解析展平 obs → tokens [B, N, D], context [B, D]
         """
+        if obs.dim() != 2:
+            raise ValueError("Nesting observations must have shape [batch, obs_dim]")
+        self.layout.validate_observation_width(obs.shape[-1])
         B = obs.shape[0]
-        part_flat_dim = self.max_parts * self.item_dim
-
-        part_feats = obs[:, :part_flat_dim].view(B, self.max_parts, self.item_dim)
-        state_feat = obs[:, part_flat_dim:part_flat_dim + self.state_feat_dim]
+        part_feats = obs[:, self.layout.part_slice].reshape(
+            B, self.layout.max_parts, self.layout.part_dim)
+        state_feat = obs[:, self.layout.state_slice]
 
         H = self.part_encoder(part_feats)                 # [B, N, D]
-        context, _ = self.step_decoder(state_feat, H)     # [B, D]
+        valid_mask = self.part_encoder.get_valid_mask(part_feats)
+        context, _ = self.step_decoder(state_feat, H, valid_mask)  # [B, D]
         return H, context
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
@@ -81,16 +96,32 @@ class PointerActorCriticPolicy(MaskableActorCriticPolicy):
         observation_space,
         action_space,
         lr_schedule: Schedule,
-        item_dim: int = 5,
+        item_dim: int = None,
         global_prefix_dim: int = 0,
         embed_dim: int = 128,
         n_heads: int = 4,
         n_layers: int = 2,
-        n_parts: int = 120,
+        n_parts: int = None,
         n_actions_per_part: int = 6,
-        state_feat_dim: int = 57,
+        state_feat_dim: int = None,
+        layout: NestingObservationLayout = None,
         **kwargs
     ):
+        self.layout = layout or NestingObservationLayout()
+        item_dim = self.layout.part_dim if item_dim is None else item_dim
+        n_parts = self.layout.max_parts if n_parts is None else n_parts
+        state_feat_dim = self.layout.state_dim if state_feat_dim is None else state_feat_dim
+        if (item_dim, n_parts, state_feat_dim) != (
+                self.layout.part_dim, self.layout.max_parts, self.layout.state_dim):
+            if item_dim == 5:
+                raise ValueError(LEGACY_NESTING_SCHEMA_ERROR)
+            raise ValueError("Pointer policy dimensions must match its observation layout")
+        if observation_space.shape != (self.layout.obs_dim,):
+            self.layout.validate_observation_width(observation_space.shape[-1])
+        expected_actions = self.layout.max_parts * n_actions_per_part
+        if action_space.n != expected_actions:
+            raise ValueError(
+                f"Expected {expected_actions} nesting actions, got {action_space.n}")
         self.item_dim = item_dim
         self.global_prefix_dim = global_prefix_dim
         self.embed_dim = embed_dim
@@ -113,6 +144,7 @@ class PointerActorCriticPolicy(MaskableActorCriticPolicy):
             n_layers=self.n_layers,
             max_parts=self.n_parts,
             state_feat_dim=self.state_feat_dim,
+            layout=self.layout,
         )
 
         self.pointer_head = PointerActorHead(

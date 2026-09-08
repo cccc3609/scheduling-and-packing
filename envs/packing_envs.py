@@ -6,8 +6,8 @@ Patch 2 boundary:
   - terminal scheduling evaluation is performed by integration wrappers.
 
 解耦接口：
-  get_part_feats()  → [max_capacity, 5]  供 PartEncoder
-  get_state_feat()  → [57]               供 StepDecoder
+  get_part_feats()  → canonical 6-D part tokens for PartEncoder
+  get_state_feat()  → canonical global + skyline + context for StepDecoder
 """
 
 import gymnasium as gym
@@ -21,6 +21,10 @@ from heuristic.blf_skyline_maxrects import PlacementCandidate, PlateLayoutManage
 from heuristic.scheduler import SchedulerStateMachine
 from config import MAX_PARTS_CAPACITY, TRAIN_CONFIG, MAX_SCHED_TASKS_CAPACITY, COST_CONFIG, FEATURE_CONFIG
 from core.instance import ProductionInstance, generate_instance
+from core.nesting_observation import (
+    NESTING_CONTEXT_DIM, NESTING_SKYLINE_DIM,
+    NestingObservationLayout, NestingPartFeature,
+)
 from core.processing import parts_cutting_time, plate_processing_time
 from core.scheduling_problem import NestingTerminalResult, NestedPlateResult
 
@@ -41,16 +45,27 @@ class _ResolvedNestingAction:
 
 class NestingSchedulingEnv(gym.Env):
 
-    PART_FEAT_DIM  = 5
-    STATE_FEAT_DIM = 57
     NUM_ROTATIONS = 2
     NUM_STRATEGIES = 3
     ACTIONS_PER_PART = NUM_ROTATIONS * NUM_STRATEGIES
 
-    def __init__(self, plate_size=(200, 200)):
+    def __init__(self, plate_size=(200, 200), observation_layout=None):
         super().__init__()
 
-        self.max_capacity      = MAX_PARTS_CAPACITY
+        runtime_layout = observation_layout or NestingObservationLayout(
+            max_parts=MAX_PARTS_CAPACITY,
+            skyline_dim=FEATURE_CONFIG.get(
+                'skyline_bins', NESTING_SKYLINE_DIM),
+        )
+        if runtime_layout.context_dim != NESTING_CONTEXT_DIM:
+            raise ValueError(
+                f"Nesting scheduling context is fixed at {NESTING_CONTEXT_DIM} dimensions")
+        self.layout = runtime_layout
+        # Compatibility alias. The runtime authority is the immutable layout.
+        self.observation_layout = self.layout
+        self.PART_FEAT_DIM = self.layout.part_dim
+        self.STATE_FEAT_DIM = self.layout.state_dim
+        self.max_capacity      = self.layout.max_parts
         self.max_sched_capacity = MAX_SCHED_TASKS_CAPACITY
         self.current_num_parts  = TRAIN_CONFIG['min_parts']
 
@@ -70,15 +85,15 @@ class NestingSchedulingEnv(gym.Env):
         self.w_terminal    = 10.0
 
         # 通信向量维度
-        self.COMM_DIM_IN  = 16
+        self.COMM_DIM_IN  = self.layout.context_dim
         self.COMM_DIM_OUT = 8
-        self.skyline_bins = FEATURE_CONFIG.get('skyline_bins', 20)
+        self.skyline_bins = self.layout.skyline_dim
         self.num_strategies = self.NUM_STRATEGIES
 
         # obs 维度
-        _obs_dim = self.max_capacity * self.PART_FEAT_DIM + self.STATE_FEAT_DIM
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(_obs_dim,), dtype=np.float32)
+            low=-np.inf, high=np.inf,
+            shape=(self.layout.obs_dim,), dtype=np.float32)
         self.action_space = spaces.Discrete(
             self.max_capacity * self.ACTIONS_PER_PART)
 
@@ -159,13 +174,14 @@ class NestingSchedulingEnv(gym.Env):
         feats = np.zeros((self.max_capacity, self.PART_FEAT_DIM), dtype=np.float32)
         for i in range(self.current_num_parts):
             p = self.parts_pool[i]
-            feats[i] = [
-                p['w'] / self.plate_w,
-                p['h'] / self.plate_h,
-                p['area'] / plate_area,
-                (p['due_date'] - curr_time) / safe_scale,
-                1.0 if i in self.packed_indices else 0.0,
-            ]
+            feats[i, NestingPartFeature.WIDTH] = p['w'] / self.plate_w
+            feats[i, NestingPartFeature.HEIGHT] = p['h'] / self.plate_h
+            feats[i, NestingPartFeature.AREA] = p['area'] / plate_area
+            feats[i, NestingPartFeature.DUE_SLACK] = (
+                p['due_date'] - curr_time) / safe_scale
+            feats[i, NestingPartFeature.PACKED] = (
+                1.0 if i in self.packed_indices else 0.0)
+            feats[i, NestingPartFeature.VALID] = 1.0
         return feats
 
     def get_state_feat(self) -> np.ndarray:
@@ -237,13 +253,19 @@ class NestingSchedulingEnv(gym.Env):
         ], dtype=np.float32)
 
         state = np.concatenate([global_feats, skyline_feat, self.sched_intent_vec])
+        if state.shape != (self.observation_layout.state_dim,):
+            raise RuntimeError(
+                f"Nesting state width mismatch: expected {self.observation_layout.state_dim}, "
+                f"got {state.shape[0]}")
         return np.clip(np.nan_to_num(state, 0.0), -5.0, 5.0).astype(np.float32)
 
     def _get_obs(self) -> np.ndarray:
-        return np.concatenate([
+        obs = np.concatenate([
             self.get_part_feats().flatten(),
             self.get_state_feat(),
         ]).astype(np.float32)
+        self.observation_layout.validate_observation_width(obs.shape[-1])
+        return obs
 
     # ── Step ─────────────────────────────────────────────────────────────────
 

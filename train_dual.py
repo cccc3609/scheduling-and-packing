@@ -31,7 +31,7 @@ from integration.scheduling_problem_provider import SchedulingProblemProviderWra
 from integration.scheduling_terminal_reward import SchedulingTerminalRewardWrapper
 from models.pointer_extractor import NestingModel
 from models.attention_extractor import AttentionFeatureExtractor
-from config import TRAIN_CONFIG, MAX_PARTS_CAPACITY
+from config import TRAIN_CONFIG
 from core.scheduling_observation import SchedulingObservationLayout
 
 try:
@@ -43,9 +43,6 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 # 常量
 # ─────────────────────────────────────────────────────────────────────────────
-PART_FEAT_DIM  = NestingSchedulingEnv.PART_FEAT_DIM   # 5
-STATE_FEAT_DIM = NestingSchedulingEnv.STATE_FEAT_DIM  # 57
-MAX_PARTS      = MAX_PARTS_CAPACITY                    # 120
 N_ACTIONS_PER  = 6                                     # 2旋转 × 3策略
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -113,6 +110,7 @@ class NestingPPO:
         self.batch_size  = batch_size
         self.n_epochs    = n_epochs
         self.total_steps = 0
+        self.last_rollout_buffer = None
 
         self.optimizer = optim.Adam(model.parameters(), lr=lr)
 
@@ -134,13 +132,11 @@ class NestingPPO:
         buf_masks       = []
 
         obs, info = self.env.reset()
-        part_feats_np = self.env.get_part_feats()
-        H = None
-
         ep_rewards = []
         ep_r = 0.0
 
         for _ in range(self.n_steps):
+            part_feats_np = self.env.get_part_feats()
             state_feat_np = self.env.get_state_feat()
             action_mask   = self.env.unwrapped._get_action_mask()
 
@@ -149,9 +145,7 @@ class NestingPPO:
             msk_t = self._to_tensor(action_mask).bool().unsqueeze(0)
 
             with torch.no_grad():
-                if H is None:
-                    H = self.model.encode_parts(pf_t)
-                logits, value = self.model.decode_step(sf_t, H, msk_t)
+                logits, value = self.model.forward_decision(pf_t, sf_t, msk_t)
                 dist   = Categorical(logits=logits)
                 action = dist.sample()
                 log_prob = dist.log_prob(action)
@@ -174,16 +168,12 @@ class NestingPPO:
                 ep_rewards.append(ep_r)
                 ep_r = 0.0
                 obs, info = self.env.reset()
-                part_feats_np = self.env.get_part_feats()
-                H = None
 
         # bootstrap
         with torch.no_grad():
             sf_last = self._to_tensor(self.env.get_state_feat()).unsqueeze(0)
-            pf_last = self._to_tensor(part_feats_np).unsqueeze(0)
-            if H is None:
-                H = self.model.encode_parts(pf_last)
-            _, last_value = self.model.decode_step(sf_last, H)
+            pf_last = self._to_tensor(self.env.get_part_feats()).unsqueeze(0)
+            _, last_value = self.model.forward_decision(pf_last, sf_last)
         last_val = float(last_value.item()) * (1.0 - buf_dones[-1])
 
         # GAE
@@ -195,6 +185,17 @@ class NestingPPO:
             gae   = delta + self.gamma * self.gae_lambda * (1 - buf_dones[t]) * gae
             advantages[t] = gae
         returns = advantages + np.array(buf_values, dtype=np.float32)
+
+        self.last_rollout_buffer = {
+            "part_feats": [item.copy() for item in buf_part_feats],
+            "state_feats": [item.copy() for item in buf_state_feats],
+            "action_masks": [item.copy() for item in buf_masks],
+            "actions": list(buf_actions),
+            "old_log_probs": list(buf_log_probs),
+            "values": list(buf_values),
+            "rewards": list(buf_rewards),
+            "dones": list(buf_dones),
+        }
 
         mean_ep_r = float(np.mean(ep_rewards)) if ep_rewards else 0.0
         return (buf_part_feats, buf_state_feats, buf_actions, buf_log_probs,
@@ -226,8 +227,7 @@ class NestingPPO:
                 act    = torch.as_tensor([buf_actions[i] for i in b],
                                          dtype=torch.long, device=self.device)
 
-                H      = self.model.encode_parts(pf)
-                logits, value = self.model.decode_step(sf, H, msk)
+                logits, value = self.model.forward_decision(pf, sf, msk)
 
                 dist    = Categorical(logits=logits)
                 new_lp  = dist.log_prob(act)
@@ -276,8 +276,7 @@ class NestingPPO:
         msk = self._to_tensor(mask).bool().unsqueeze(0)
 
         with torch.no_grad():
-            H = self.model.encode_parts(pf)
-            logits, _ = self.model.decode_step(sf, H, msk)
+            logits, _ = self.model.forward_decision(pf, sf, msk)
             if deterministic:
                 action = int(logits.argmax(dim=-1).item())
             else:
@@ -302,36 +301,34 @@ def make_sched_policy_kwargs(layout: SchedulingObservationLayout):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# NestingModelPredictor — 带 H 缓存
+# NestingModelPredictor — current-decision encoding
 # ─────────────────────────────────────────────────────────────────────────────
 
 class NestingModelPredictor:
     """
-    SB3-like predict 接口，带 H 缓存。
+    SB3-like predict interface. Dynamic part tokens are encoded every call.
     """
 
     def __init__(self, ppo: NestingPPO, env: NestingSchedulingEnv):
         self.ppo = ppo
         self.env = env
-        self._H_cache = None
+        if self.ppo.model.layout != self.env.unwrapped.layout:
+            raise ValueError("Nesting predictor model and environment layouts must match")
 
     def reset_cache(self):
-        self._H_cache = None
+        """Compatibility no-op: Patch 5 forbids an episode-level H cache."""
 
     def predict(self, obs, action_masks=None, deterministic=True):
         state_feat = self.env.get_state_feat()
         mask       = self.env.unwrapped._get_action_mask()
+        part_feats = self.env.get_part_feats()
 
+        pf  = self.ppo._to_tensor(part_feats).unsqueeze(0)
         sf  = self.ppo._to_tensor(state_feat).unsqueeze(0)
         msk = self.ppo._to_tensor(mask).bool().unsqueeze(0)
 
         with torch.no_grad():
-            if self._H_cache is None:
-                part_feats = self.env.get_part_feats()
-                pf = self.ppo._to_tensor(part_feats).unsqueeze(0)
-                self._H_cache = self.ppo.model.encode_parts(pf)
-
-            logits, _ = self.ppo.model.decode_step(sf, self._H_cache, msk)
+            logits, _ = self.ppo.model.forward_decision(pf, sf, msk)
             if deterministic:
                 action = int(logits.argmax(dim=-1).item())
             else:
@@ -354,16 +351,18 @@ def main():
 
     # ── 环境 ──
     nest_base = NestingSchedulingEnv()
+    nesting_layout = nest_base.layout
 
     # ── 模型 ──
     nesting_model = NestingModel(
-        part_feat_dim=PART_FEAT_DIM,
-        state_feat_dim=STATE_FEAT_DIM,
+        part_feat_dim=nesting_layout.part_dim,
+        state_feat_dim=nesting_layout.state_dim,
         embed_dim=128,
         n_heads=4,
         n_enc_layers=2,
         n_actions_per_part=N_ACTIONS_PER,
-        max_parts=MAX_PARTS,
+        max_parts=nesting_layout.max_parts,
+        layout=nesting_layout,
     )
 
     nesting_ppo = NestingPPO(
@@ -385,7 +384,8 @@ def main():
     terminal_nest_env = SchedulingTerminalRewardWrapper(
         nest_base, evaluation_mode="edd")
     nesting_ppo.env = terminal_nest_env
-    provider_nest_env = NestingSchedulingEnv()
+    provider_nest_env = NestingSchedulingEnv(
+        observation_layout=nesting_layout)
     provider_predictor = NestingModelPredictor(nesting_ppo, provider_nest_env)
     sched_env = SchedulingEnv()
     sched_provider = SchedulingProblemProviderWrapper(

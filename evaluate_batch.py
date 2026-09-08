@@ -11,10 +11,9 @@ from models.sched_policy_loader import load_scheduling_policy
 from envs.packing_envs import NestingSchedulingEnv
 from envs.scheduling_env import SchedulingEnv
 from integration.scheduling_terminal_reward import SchedulingTerminalRewardWrapper
-from models.pointer_extractor import NestingModel
+from models.pointer_extractor import NestingModel, load_nesting_state_dict_strict
 from heuristic.blf_skyline_maxrects import PlateLayoutManager
 from heuristic.scheduler import SchedulerStateMachine
-from config import MAX_PARTS_CAPACITY
 from core.cost import GlobalCostFunction
 from core.processing import plate_processing_time
 
@@ -22,9 +21,6 @@ plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial']
 plt.rcParams['axes.unicode_minus'] = False
 
 # ── 与 train_dual.py 保持一致的常量 ─────────────────────────────────────────
-PART_FEAT_DIM  = NestingSchedulingEnv.PART_FEAT_DIM    # 5
-STATE_FEAT_DIM = NestingSchedulingEnv.STATE_FEAT_DIM   # 57
-MAX_PARTS      = MAX_PARTS_CAPACITY                     # 120
 N_ACTIONS_PER  = 6                                      # 2旋转 × 3策略
 
 
@@ -96,19 +92,20 @@ def find_latest_models(exp_root: str = "./experiments"):
     return None, None, None
 
 
-def load_nesting_model(pt_path: str, device: str = "cpu") -> NestingModel:
+def load_nesting_model(pt_path: str, layout, device: str = "cpu") -> NestingModel:
     """加载 NestingModel 权重。"""
     model = NestingModel(
-        part_feat_dim=PART_FEAT_DIM,
-        state_feat_dim=STATE_FEAT_DIM,
+        part_feat_dim=layout.part_dim,
+        state_feat_dim=layout.state_dim,
         embed_dim=128,
         n_heads=4,
         n_enc_layers=2,
         n_actions_per_part=N_ACTIONS_PER,
-        max_parts=MAX_PARTS,
+        max_parts=layout.max_parts,
+        layout=layout,
     ).to(device)
     state_dict = torch.load(pt_path, map_location=device)
-    model.load_state_dict(state_dict)
+    load_nesting_state_dict_strict(model, state_dict)
     model.eval()
     print(f"[INFO] Nesting 模型加载完成: {os.path.basename(pt_path)}")
     return model
@@ -128,20 +125,18 @@ def run_rl_episode(
 ) -> NestingSchedulingEnv:
     """
     用 NestingModel 跑完一局排样。
-    Encoder 在 episode 开始时只运行一次，Decoder 每步轻量调用。
+    Dynamic part tokens are freshly encoded for every decision.
     返回完成后的环境（含 cost_metrics、history_plates、orders 等）。
     """
     obs, _info = env.reset(seed=seed, options=options or {})
-
-    # ── episode 级：只编码一次零件特征 ──
-    pf = torch.as_tensor(
-        env.get_part_feats(), dtype=torch.float32, device=device
-    ).unsqueeze(0)                         # [1, N, 5]
-    H = model.encode_parts(pf)             # [1, N, 128]
+    if model.layout != env.unwrapped.layout:
+        raise ValueError("Evaluation model and environment layouts must match")
 
     done = False
     while not done:
-        # ── 步级：轻量 Decoder ──
+        pf = torch.as_tensor(
+            env.get_part_feats(), dtype=torch.float32, device=device
+        ).unsqueeze(0)
         sf = torch.as_tensor(
             env.get_state_feat(), dtype=torch.float32, device=device
         ).unsqueeze(0)                     # [1, 57]
@@ -150,7 +145,7 @@ def run_rl_episode(
             env._get_action_mask(), dtype=torch.bool, device=device
         ).unsqueeze(0)                     # [1, 720]
 
-        logits, _ = model.decode_step(sf, H, mask)
+        logits, _ = model.forward_decision(pf, sf, mask)
         action = int(logits.argmax(dim=-1).item())
 
         obs, _reward, terminated, truncated, _info = env.step(action)
@@ -449,7 +444,8 @@ def main():
     if not nest_pt:
         return
 
-    nest_model  = load_nesting_model(nest_pt, device)
+    rl_env = NestingSchedulingEnv()
+    nest_model  = load_nesting_model(nest_pt, rl_env.layout, device)
     sched_model = None
     if sched_zip and os.path.exists(sched_zip + ".zip"):
         sched_model = load_scheduling_policy(sched_zip, device=device)
@@ -465,7 +461,6 @@ def main():
 
     # ── 3. RL 推理 ─────────────────────────────────────────────────────────────
     print("\n[Player 1] Dual-Agent RL ...")
-    rl_env = NestingSchedulingEnv()
     rl_evaluator = SchedulingTerminalRewardWrapper(
         rl_env, evaluation_mode="edd")
     run_rl_episode(

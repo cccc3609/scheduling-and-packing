@@ -15,6 +15,7 @@ from envs.scheduling_env import SchedulingEnv
 from integration.scheduling_terminal_reward import SchedulingTerminalRewardWrapper
 from models.attention_extractor import AttentionFeatureExtractor
 from config import COST_CONFIG, TRAIN_CONFIG
+from core.nesting_observation import validate_nesting_checkpoint_observation_space
 
 # 配置字体
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial']
@@ -231,6 +232,7 @@ def main():
 
     print("Loading Models...")
     nest_model = MaskablePPO.load(nest_path)
+    validate_nesting_checkpoint_observation_space(nest_model)
     sched_model = MaskablePPO.load(sched_path)
 
     print("Generating Visualization...")

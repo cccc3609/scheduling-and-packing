@@ -13,6 +13,7 @@ from integration.scheduling_problem_provider import SchedulingProblemProviderWra
 from integration.scheduling_terminal_reward import SchedulingTerminalRewardWrapper
 from custom_callbacks import TensorboardCallback, SnapshotCallback
 from config import TRAIN_CONFIG
+from core.nesting_observation import LEGACY_NESTING_SCHEMA_ERROR
 
 # ================= 配置区域 (请修改这里) =================
 # 1. 上次中断的实验文件夹路径
@@ -120,13 +121,18 @@ def main():
     }
 
     # 加载 Nesting
-    nest_model = MaskablePPO.load(
-        nest_path,
-        env=nest_env,  # 绑定新环境
-        custom_objects=custom_objects,
-        tensorboard_log=log_n,  # 指向新日志目录
-        print_system_info=True
-    )
+    try:
+        nest_model = MaskablePPO.load(
+            nest_path,
+            env=nest_env,  # 绑定新环境
+            custom_objects=custom_objects,
+            tensorboard_log=log_n,  # 指向新日志目录
+            print_system_info=True
+        )
+    except ValueError as exc:
+        if "Observation spaces do not match" in str(exc):
+            raise ValueError(LEGACY_NESTING_SCHEMA_ERROR) from exc
+        raise
 
     sched_env = ActionMasker(
         SchedulingProblemProviderWrapper(sched_base, nest_env, nest_model), mask_fn)

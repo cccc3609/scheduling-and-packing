@@ -13,6 +13,7 @@ from sb3_contrib.common.wrappers import ActionMasker
 from envs.packing_envs import NestingSchedulingEnv
 from envs.scheduling_env import SchedulingEnv
 from models.attention_extractor import AttentionFeatureExtractor  # 🟢 必须引入，否则加载模型报错
+from core.nesting_observation import validate_nesting_checkpoint_observation_space
 
 # 配置字体
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial']
@@ -169,6 +170,7 @@ def main():
 
     print("⏳ 正在加载模型...")
     nest_model = MaskablePPO.load(nest_path)
+    validate_nesting_checkpoint_observation_space(nest_model)
     sched_model = MaskablePPO.load(sched_path)
 
     print("🚀 正在生成排样方案...")
