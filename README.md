@@ -1,1 +1,1 @@
-# multi-agent-scheduling-and-packing
+# scheduling-and-packing
