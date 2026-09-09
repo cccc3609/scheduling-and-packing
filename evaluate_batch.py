@@ -1,5 +1,5 @@
 
-import os, glob, random, math, copy
+import os, random, math, copy
 import numpy as np
 import torch
 import matplotlib
@@ -16,6 +16,11 @@ from heuristic.blf_skyline_maxrects import PlateLayoutManager
 from heuristic.scheduler import SchedulerStateMachine
 from core.cost import GlobalCostFunction
 from core.processing import plate_processing_time
+from integration.evaluation_checkpoint import resolve_latest_phase3_pair
+from integration.evaluation_results import (
+    build_manifest, case_record, create_run_directory, formal_metrics,
+    make_evaluation_case, make_run_id, write_evaluation_results,
+)
 
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial']
 plt.rcParams['axes.unicode_minus'] = False
@@ -29,67 +34,9 @@ N_ACTIONS_PER  = 6                                      # 2旋转 × 3策略
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def find_latest_models(exp_root: str = "./experiments"):
-    """
-    从 experiments/ 目录找最新实验的模型文件。
-    返回 (nest_pt_path, sched_zip_prefix, exp_dir)
-      nest_pt_path  : nesting_joint_cN_final.pt 的完整路径
-      sched_zip_prefix : scheduling_joint_cN（不含 .zip 后缀，MaskablePPO.load 需要这样）
-      exp_dir       : 实验根目录
-    """
-    if not os.path.exists(exp_root):
-        print(f"[ERROR] experiments 目录不存在: {exp_root}")
-        return None, None, None
-
-    exp_dirs = sorted(
-        glob.glob(os.path.join(exp_root, "exp_*")),
-        key=os.path.getctime, reverse=True
-    )
-    if not exp_dirs:
-        print("[ERROR] 未找到任何实验目录")
-        return None, None, None
-
-    for exp_dir in exp_dirs:
-        model_dir = os.path.join(exp_dir, "models")
-        if not os.path.exists(model_dir):
-            continue
-
-        files = os.listdir(model_dir)
-
-        # 找最大的 joint cycle（nesting 用 _final.pt，scheduling 用 .zip）
-        nest_cycles  = set()
-        sched_cycles = set()
-        for f in files:
-            if f.startswith("nesting_joint_c") and f.endswith("_final.pt"):
-                try:
-                    c = int(f.replace("nesting_joint_c", "").replace("_final.pt", ""))
-                    nest_cycles.add(c)
-                except ValueError:
-                    pass
-            if f.startswith("scheduling_joint_c") and f.endswith(".zip"):
-                try:
-                    c = int(f.replace("scheduling_joint_c", "").replace(".zip", ""))
-                    sched_cycles.add(c)
-                except ValueError:
-                    pass
-
-        valid = nest_cycles & sched_cycles
-        if valid:
-            c = max(valid)
-            nest_pt   = os.path.join(model_dir, f"nesting_joint_c{c}_final.pt")
-            sched_zip = os.path.join(model_dir, f"scheduling_joint_c{c}")
-            print(f"[INFO] 实验: {os.path.basename(exp_dir)} | joint_cycle={c}")
-            return nest_pt, sched_zip, exp_dir
-
-        # fallback：phase1 预热模型
-        if "nesting_phase1_final.pt" in files:
-            nest_pt = os.path.join(model_dir, "nesting_phase1_final.pt")
-            sched_zip = (os.path.join(model_dir, "scheduling_phase2")
-                         if "scheduling_phase2.zip" in files else None)
-            print("[WARN] 使用 Phase1 预热模型（未找到联合微调模型）")
-            return nest_pt, sched_zip, exp_dir
-
-    print("[ERROR] 未找到可用的模型文件")
-    return None, None, None
+    pair = resolve_latest_phase3_pair(exp_root)
+    return (str(pair.nesting_checkpoint), str(pair.scheduling_checkpoint),
+            str(pair.experiment_dir))
 
 
 def load_nesting_model(pt_path: str, layout, device: str = "cpu") -> NestingModel:
@@ -230,6 +177,8 @@ def run_ffd_edd_baseline(
         'cost_total':    cost['cost_total'],
         'utilization':   utilization,
         'plate_count':   len(final_plates),
+        'late_count':    cost['late_count'],
+        'total_delay':   cost['total_delay'],
     }
     return final_plates, scheduler.log, orders, metrics
 
@@ -439,24 +388,24 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}\n")
 
-    # ── 1. 找模型 ──────────────────────────────────────────────────────────────
-    nest_pt, sched_zip, exp_dir = find_latest_models()
-    if not nest_pt:
-        return
+    # ── 1. 严格解析 Patch 7 同轮 checkpoint pair ─────────────────────────────
+    pair = resolve_latest_phase3_pair()
+    nest_pt = str(pair.nesting_checkpoint)
+    sched_zip = str(pair.scheduling_checkpoint)
 
     rl_env = NestingSchedulingEnv()
     nest_model  = load_nesting_model(nest_pt, rl_env.layout, device)
-    sched_model = None
-    if sched_zip and os.path.exists(sched_zip + ".zip"):
-        sched_model = load_scheduling_policy(sched_zip, device=device)
-        print(f"[INFO] Scheduling 模型加载完成: {os.path.basename(sched_zip)}")
-    else:
-        raise FileNotFoundError(
-            "Dual-Agent RL evaluation requires a scheduling policy checkpoint")
+    sched_model = load_scheduling_policy(sched_zip, device=device)
+    print(f"[INFO] Scheduling 模型加载完成: {os.path.basename(sched_zip)}")
 
     # ── 2. 固定测试数据 ─────────────────────────────────────────────────────────
     TEST_N, TEST_W, TEST_H = 60, 200, 200
     SEED = 1000
+    case = make_evaluation_case(
+        0, SEED, num_parts=TEST_N, plate_size=(TEST_W, TEST_H),
+        scenario="batch", config={"evaluation": "batch"})
+    run_id = make_run_id("batch", pair, SEED)
+    run_dir = create_run_directory("./evaluation_results", run_id)
 
     print(f"\n生成测试数据: {TEST_N} 件 | 板材 {TEST_W}×{TEST_H} | Seed={SEED}")
 
@@ -466,25 +415,33 @@ def main():
     run_rl_episode(
         rl_evaluator, nest_model, device=device,
         seed=SEED,
-        options={"num_parts": TEST_N, "plate_size": (TEST_W, TEST_H)},
+        options={"instance": case.independent_instance()},
     )
-    rl_metrics = rl_env.cost_metrics
+    rl_formal = formal_metrics(
+        rl_env.history_plates, rl_env.orders, rl_env.parts_pool,
+        rl_env.plate_w, rl_env.plate_h)
+    rl_metrics = {
+        'cost_material': rl_formal['Material_Cost'],
+        'cost_jit': rl_formal['JIT_Cost'],
+        'cost_total': rl_formal['Total_Cost'],
+        'utilization': rl_formal['Utilization'],
+        'plate_count': rl_formal['Plate_Count'],
+    }
 
     # 保存测试数据快照（确保基线和 RL 使用完全相同的订单）
-    parts_pool_snap = copy.deepcopy(rl_env.parts_pool)
-    orders_snap     = copy.deepcopy(rl_env.orders)
-    for o in orders_snap.values():
-        o['finished_time'] = 0.0
+    baseline_instance = case.independent_instance()
+    parts_pool_snap = baseline_instance.parts
+    orders_snap = baseline_instance.orders
 
     order_colors = _rand_colors(len(orders_snap) + 5)
 
     print("  生成 RL 可视化图表...")
     plot_nesting(rl_env.history_plates, order_colors,
-                 save_dir=exp_dir, file_prefix="RL")
+                 save_dir=str(run_dir), file_prefix="RL")
     plot_gantt(rl_env.scheduler_state_machine.log, rl_env.orders,
-               order_colors, save_dir=exp_dir, file_prefix="RL")
+               order_colors, save_dir=str(run_dir), file_prefix="RL")
     plot_jit_analysis(rl_env.orders, rl_metrics,
-                      save_dir=exp_dir, file_prefix="RL")
+                      save_dir=str(run_dir), file_prefix="RL")
 
     # ── 4. FFD+EDD 基线 ────────────────────────────────────────────────────────
     print("\n[Player 2] FFD+EDD Baseline ...")
@@ -493,14 +450,34 @@ def main():
     )
     print("  生成基线可视化图表...")
     plot_nesting(base_plates, order_colors,
-                 save_dir=exp_dir, file_prefix="Baseline")
+                 save_dir=str(run_dir), file_prefix="Baseline")
     plot_gantt(base_logs, base_orders, order_colors,
-               save_dir=exp_dir, file_prefix="Baseline")
+               save_dir=str(run_dir), file_prefix="Baseline")
     plot_jit_analysis(base_orders, base_metrics,
-                      save_dir=exp_dir, file_prefix="Baseline")
+                      save_dir=str(run_dir), file_prefix="Baseline")
 
     # ── 5. 对比图 ──────────────────────────────────────────────────────────────
-    plot_comparison_bar(rl_metrics, base_metrics, save_dir=exp_dir)
+    plot_comparison_bar(rl_metrics, base_metrics, save_dir=str(run_dir))
+    baseline_formal = {
+        "Utilization": base_metrics["utilization"],
+        "Plate_Count": base_metrics["plate_count"],
+        "Late_Count": base_metrics["late_count"],
+        "Total_Delay_Time": base_metrics["total_delay"],
+        "JIT_Cost": base_metrics["cost_jit"],
+        "Material_Cost": base_metrics["cost_material"],
+        "Total_Cost": base_metrics["cost_total"],
+    }
+    records = [
+        case_record(run_id, case, "Dual-Agent RL", evaluation_mode="policy",
+                    pair=pair, metrics=rl_formal),
+        case_record(run_id, case, "FFD+EDD", evaluation_mode="edd",
+                    pair=None, metrics=baseline_formal),
+    ]
+    manifest = build_manifest(
+        run_id, "batch", "policy", SEED, 1, pair,
+        {"num_parts": TEST_N, "plate_size": [TEST_W, TEST_H],
+         "num_machines": case.instance.num_machines})
+    write_evaluation_results(run_dir, manifest, records)
 
     # ── 6. 打印对比表 ──────────────────────────────────────────────────────────
     print("\n" + "═" * 68)
@@ -531,7 +508,7 @@ def main():
     base_pc = int(base_metrics.get('plate_count', 0))
     print(f"  {'Plates Used':<22} {rl_pc:>14} {base_pc:>14}")
     print("═" * 68)
-    print(f"  图表已保存至: {exp_dir}\n")
+    print(f"  结果已保存至: {run_dir}\n")
 
 
 if __name__ == "__main__":

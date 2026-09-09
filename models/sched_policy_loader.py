@@ -81,18 +81,26 @@ class SchedulingPolicyInference:
         val_sd = {k.replace("value_net.", ""): v
                   for k, v in sd.items() if k.startswith("value_net.")}
 
+        groups = {
+            "features_extractor": (self.features_extractor, fe_sd),
+            "policy_net": (self.mlp_pi, pi_sd),
+            "value_net": (self.mlp_vf, vf_sd),
+            "action_net": (self.action_net, act_sd),
+            "value_head": (self.value_net, val_sd),
+        }
+        missing = [name for name, (_module, weights) in groups.items() if not weights]
+        if missing:
+            raise ValueError(
+                "Scheduling checkpoint is missing required weight groups: "
+                + ", ".join(missing))
         try:
-            self.features_extractor.load_state_dict(fe_sd, strict=True)
+            for _name, (module, weights) in groups.items():
+                module.load_state_dict(weights, strict=True)
         except RuntimeError as exc:
             raise RuntimeError(
-                "Scheduling checkpoint is incompatible with the Patch 3 "
-                "10-D task observation schema; retrain the scheduling policy."
+                "Scheduling checkpoint has missing, unexpected, or incompatible "
+                "required policy weights; retrain the scheduling policy."
             ) from exc
-        # 修复：改为 strict=True，确保权重完全对齐，防止静默错误
-        if pi_sd:  self.mlp_pi.load_state_dict(pi_sd,   strict=True)
-        if vf_sd:  self.mlp_vf.load_state_dict(vf_sd,   strict=True)
-        if act_sd: self.action_net.load_state_dict(act_sd, strict=True)
-        if val_sd: self.value_net.load_state_dict(val_sd,  strict=True)
         print(f"  [SchedulingPolicy] 权重加载完成，共 {len(sd)} 个 key")
 
     @torch.no_grad()

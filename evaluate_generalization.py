@@ -1,5 +1,5 @@
 
-import os, glob, random, math, copy
+import os, random, math, copy
 import numpy as np
 import pandas as pd
 import torch
@@ -22,6 +22,11 @@ from heuristic.scheduler import SchedulerStateMachine
 from config import TEST_SCENARIOS
 from core.cost import GlobalCostFunction
 from core.processing import plate_processing_time
+from integration.evaluation_checkpoint import resolve_latest_phase3_pair
+from integration.evaluation_results import (
+    build_manifest, case_record, create_run_directory, formal_metrics,
+    make_evaluation_case, make_run_id, write_evaluation_results,
+)
 
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial']
 plt.rcParams['axes.unicode_minus'] = False
@@ -35,54 +40,9 @@ NUM_EPISODES   = 20   # 每场景跑多少局
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def find_latest_models(exp_root: str = "./experiments"):
-    if not os.path.exists(exp_root):
-        print(f"[ERROR] 目录不存在: {exp_root}")
-        return None, None, None
-
-    exp_dirs = sorted(
-        glob.glob(os.path.join(exp_root, "exp_*")),
-        key=os.path.getctime, reverse=True,
-    )
-    for exp_dir in exp_dirs:
-        model_dir = os.path.join(exp_dir, "models")
-        if not os.path.exists(model_dir):
-            continue
-        files = os.listdir(model_dir)
-
-        nest_cycles  = set()
-        sched_cycles = set()
-        for f in files:
-            if f.startswith("nesting_joint_c") and f.endswith("_final.pt"):
-                try:
-                    nest_cycles.add(
-                        int(f.replace("nesting_joint_c", "").replace("_final.pt", "")))
-                except ValueError:
-                    pass
-            if f.startswith("scheduling_joint_c") and f.endswith(".zip"):
-                try:
-                    sched_cycles.add(
-                        int(f.replace("scheduling_joint_c", "").replace(".zip", "")))
-                except ValueError:
-                    pass
-
-        valid = nest_cycles & sched_cycles
-        if valid:
-            c = max(valid)
-            print(f"[INFO] 实验: {os.path.basename(exp_dir)} | joint_cycle={c}")
-            return (
-                os.path.join(model_dir, f"nesting_joint_c{c}_final.pt"),
-                os.path.join(model_dir, f"scheduling_joint_c{c}"),
-                exp_dir,
-            )
-
-        if "nesting_phase1_final.pt" in files:
-            print("[WARN] 使用 Phase1 预热模型")
-            sched = (os.path.join(model_dir, "scheduling_phase2")
-                     if "scheduling_phase2.zip" in files else None)
-            return os.path.join(model_dir, "nesting_phase1_final.pt"), sched, exp_dir
-
-    print("[ERROR] 未找到模型")
-    return None, None, None
+    pair = resolve_latest_phase3_pair(exp_root)
+    return (str(pair.nesting_checkpoint), str(pair.scheduling_checkpoint),
+            str(pair.experiment_dir))
 
 
 def load_nesting_model(pt_path: str, layout, device: str = "cpu") -> NestingModel:
@@ -114,6 +74,7 @@ def run_rl_episode(
     num_parts: int,
     plate_size: tuple,
     evaluation_mode: str = "policy",
+    instance=None,
 ) -> NestingSchedulingEnv:
     """每局创建新环境，避免状态污染。"""
     base_env = NestingSchedulingEnv(observation_layout=model.layout)
@@ -123,10 +84,9 @@ def run_rl_episode(
         env = SchedulingTerminalRewardWrapper(base_env, evaluation_mode="edd")
     else:
         raise ValueError("evaluation_mode must be 'policy' or 'edd'")
-    obs, _ = env.reset(
-        seed=seed,
-        options={"num_parts": num_parts, "plate_size": plate_size},
-    )
+    options = ({"instance": copy.deepcopy(instance)} if instance is not None
+               else {"num_parts": num_parts, "plate_size": plate_size})
+    obs, _ = env.reset(seed=seed, options=options)
 
     done = False
     while not done:
@@ -210,6 +170,8 @@ def run_baseline_episode(
         'cost_jit':      cost['cost_jit'],
         'plate_count':   len(final_plates),
         'late_rate':     cost['late_count'] / max(1, len(orders)),
+        'late_count':    cost['late_count'],
+        'total_delay':   cost['total_delay'],
     }
 
 
@@ -322,26 +284,24 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}\n")
 
-    nest_pt, sched_zip, exp_dir = find_latest_models()
-    if not nest_pt:
-        return
+    pair = resolve_latest_phase3_pair()
+    nest_pt = str(pair.nesting_checkpoint)
+    sched_zip = str(pair.scheduling_checkpoint)
 
     runtime_env = NestingSchedulingEnv()
     nest_model  = load_nesting_model(nest_pt, runtime_env.layout, device)
-    sched_model = None
-    if sched_zip and os.path.exists(sched_zip + ".zip"):
-        sched_model = load_scheduling_policy(sched_zip, device=device)
-    else:
-        raise FileNotFoundError(
-            "Dual-Agent RL generalization evaluation requires a scheduling checkpoint")
-        print(f"[INFO] Scheduling 模型: {os.path.basename(sched_zip)}")
+    sched_model = load_scheduling_policy(sched_zip, device=device)
+    print(f"[INFO] Scheduling 模型: {os.path.basename(sched_zip)}")
 
-    report_dir = os.path.join(exp_dir, "generalization_report")
-    os.makedirs(report_dir, exist_ok=True)
+    base_seed = 2000
+    run_id = make_run_id("generalization", pair, base_seed)
+    report_dir = str(create_run_directory("./evaluation_results", run_id))
     print(f"报告目录: {report_dir}\n")
 
     rl_rows   = []
     base_rows = []
+    case_records = []
+    next_case_id = 0
 
     for scenario in TEST_SCENARIOS:
         name      = scenario["name"]
@@ -364,29 +324,33 @@ def main():
         last_rl_env = None
 
         for ep in tqdm(range(NUM_EPISODES), desc=f"  {safe_name[:28]}"):
-            seed = 2000 + ep
-            np.random.seed(seed); random.seed(seed)
+            case = make_evaluation_case(
+                next_case_id, base_seed, num_parts=num_parts,
+                plate_size=plate_size, scenario=name,
+                config={"scenario_index": TEST_SCENARIOS.index(scenario)})
+            next_case_id += 1
+            seed = case.case_seed
 
             # ── RL ──
             rl_env = run_rl_episode(
                 nest_model, sched_model, device,
                 seed, num_parts, plate_size,
+                evaluation_mode="policy", instance=case.independent_instance(),
             )
-            cm = rl_env.cost_metrics
-            rl_util.append(cm.get('utilization', 0))
-            rl_cost.append(cm.get('cost_total', 0))
-            rl_mat.append(cm.get('cost_material', 0))
-            rl_jit.append(cm.get('cost_jit', 0))
-            rl_pc.append(cm.get('plate_count', 0))
-            late = sum(1 for o in rl_env.orders.values()
-                       if o['finished_time'] > o['due_date'])
-            rl_late.append(late / max(1, len(rl_env.orders)))
+            rl_formal = formal_metrics(
+                rl_env.history_plates, rl_env.orders, rl_env.parts_pool,
+                rl_env.plate_w, rl_env.plate_h)
+            rl_util.append(rl_formal['Utilization'])
+            rl_cost.append(rl_formal['Total_Cost'])
+            rl_mat.append(rl_formal['Material_Cost'])
+            rl_jit.append(rl_formal['JIT_Cost'])
+            rl_pc.append(rl_formal['Plate_Count'])
+            rl_late.append(rl_formal['Late_Count'] / max(1, len(rl_env.orders)))
 
             # ── 基线（用相同的 parts_pool 和 orders）──
             base_m = run_baseline_episode(
-                rl_env.parts_pool,
-                {oid: {'due_date': v['due_date'], 'finished_time': 0.0}
-                 for oid, v in rl_env.orders.items()},
+                case.independent_instance().parts,
+                case.independent_instance().orders,
                 plate_w, plate_h,
             )
             base_util.append(base_m['utilization'])
@@ -395,6 +359,22 @@ def main():
             base_jit.append(base_m['cost_jit'])
             base_pc.append(base_m['plate_count'])
             base_late.append(base_m['late_rate'])
+            base_formal = {
+                "Utilization": base_m["utilization"],
+                "Plate_Count": base_m["plate_count"],
+                "Late_Count": base_m["late_count"],
+                "Total_Delay_Time": base_m["total_delay"],
+                "JIT_Cost": base_m["cost_jit"],
+                "Material_Cost": base_m["cost_material"],
+                "Total_Cost": base_m["cost_total"],
+            }
+            case_records.extend([
+                case_record(run_id, case, "Dual-Agent RL",
+                            evaluation_mode="policy", pair=pair,
+                            metrics=rl_formal),
+                case_record(run_id, case, "FFD+EDD", evaluation_mode="edd",
+                            pair=None, metrics=base_formal),
+            ])
 
             last_rl_env = rl_env
 
@@ -442,11 +422,16 @@ def main():
             save_dir=scene_dir,
         )
 
-    # ── 保存 CSV ──
+    # ── 保存逐 case source-of-truth、manifest 和派生汇总 ──
+    manifest = build_manifest(
+        run_id, "generalization", "policy", base_seed,
+        len(TEST_SCENARIOS) * NUM_EPISODES, pair,
+        {"scenarios": TEST_SCENARIOS, "num_machines": 3})
+    write_evaluation_results(report_dir, manifest, case_records)
+
+    # 下列 DataFrame 仅用于现有可视化/控制台展示。
     df_rl   = pd.DataFrame(rl_rows)
     df_base = pd.DataFrame(base_rows)
-    df_rl.to_csv(os.path.join(report_dir, "rl_summary.csv"),   index=False)
-    df_base.to_csv(os.path.join(report_dir, "base_summary.csv"), index=False)
 
     # ── 跨场景总览图 ──
     plot_overall_summary(df_rl, df_base, report_dir)

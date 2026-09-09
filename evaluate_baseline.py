@@ -1,6 +1,5 @@
 import os
 import copy
-import random  # 🔥 引入原生 random
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -12,6 +11,10 @@ from heuristic.scheduler import SchedulerStateMachine
 from config import TEST_SCENARIOS
 from core.cost import GlobalCostFunction
 from core.processing import plate_processing_time
+from integration.evaluation_results import (
+    build_manifest, case_record, create_run_directory, make_evaluation_case,
+    make_run_id, write_evaluation_results,
+)
 
 
 def run_heuristic_baseline():
@@ -19,10 +22,12 @@ def run_heuristic_baseline():
     print("🚀 开始执行传统工业基线测试 (FFD + EDD)")
     print("=" * 80)
 
-    # 准备输出目录
-    eval_report_dir = "./experiments/baseline_report"
-    os.makedirs(eval_report_dir, exist_ok=True)
+    base_seed = 2000
+    run_id = make_run_id("baseline", None, base_seed)
+    eval_report_dir = str(create_run_directory("./evaluation_results", run_id))
     summary_data = []
+    case_records = []
+    next_case_id = 0
 
     # 初始化环境仅用于生成相同的随机订单数据
     env = NestingSchedulingEnv()
@@ -48,12 +53,15 @@ def run_heuristic_baseline():
             # 🔥 绝对控制变量：强行锁死全局 Numpy 和 Python 随机种子！
             # 确保生成的订单长、宽、交期与 RL 模型做的一模一样！
             # ==========================================================
-            seed_val = 2000 + i
-            np.random.seed(seed_val)
-            random.seed(seed_val)
+            case = make_evaluation_case(
+                next_case_id, base_seed, num_parts=num_parts,
+                plate_size=plate_size, scenario=scene_name,
+                config={"scenario_index": TEST_SCENARIOS.index(scenario)})
+            next_case_id += 1
+            seed_val = case.case_seed
 
             # 1. 重置环境获取初始数据
-            env.reset(seed=seed_val, options={"num_parts": num_parts, "plate_size": plate_size})
+            env.reset(seed=seed_val, options={"instance": case.independent_instance()})
             parts_pool = copy.deepcopy(env.unwrapped.parts_pool)
             orders = copy.deepcopy(env.unwrapped.orders)
 
@@ -120,6 +128,18 @@ def run_heuristic_baseline():
             metrics["jit_cost"].append(cost['cost_jit'])
             metrics["late_rate"].append(cost['late_count'] / len(orders) if orders else 0)
             metrics["plate_count"].append(len(final_plates))
+            formal = {
+                "Utilization": cost["utilization"],
+                "Plate_Count": cost["plate_count"],
+                "Late_Count": cost["late_count"],
+                "Total_Delay_Time": cost["total_delay"],
+                "JIT_Cost": cost["cost_jit"],
+                "Material_Cost": cost["cost_material"],
+                "Total_Cost": cost["cost_total"],
+            }
+            case_records.append(case_record(
+                run_id, case, "FFD+EDD", evaluation_mode="edd",
+                pair=None, metrics=formal))
 
         # 汇总该场景数据
         summary = {
@@ -136,8 +156,10 @@ def run_heuristic_baseline():
         summary_data.append(summary)
 
     df = pd.DataFrame(summary_data)
-    csv_path = os.path.join(eval_report_dir, "baseline_summary_report.csv")
-    df.to_csv(csv_path, index=False)
+    manifest = build_manifest(
+        run_id, "baseline", "edd", base_seed, len(case_records), None,
+        {"scenarios": TEST_SCENARIOS, "num_machines": 3})
+    write_evaluation_results(eval_report_dir, manifest, case_records)
 
     print("\n" + "=" * 100)
     print("📊 传统基线测试报告 (BASELINE EVALUATION REPORT)")
@@ -146,7 +168,7 @@ def run_heuristic_baseline():
     pd.set_option('display.width', 1000)
     print(df.to_string(index=False, float_format="{:.4f}".format))
     print("=" * 100)
-    print(f"✅ 基线数据已保存在: {csv_path} (请将其与强化学习测试结果对比！)")
+    print(f"✅ 基线数据已保存在: {eval_report_dir}")
 
 
 if __name__ == "__main__":

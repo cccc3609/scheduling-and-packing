@@ -1,19 +1,22 @@
 import os
-import glob
 import random
 import math
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-from sb3_contrib import MaskablePPO
-from sb3_contrib.common.maskable.utils import get_action_masks
-from sb3_contrib.common.wrappers import ActionMasker
+import torch
 
 # 引入项目模块
 from envs.packing_envs import NestingSchedulingEnv
 from integration.scheduling_terminal_reward import make_dual_agent_terminal_wrapper
 from config import COST_CONFIG
-from core.nesting_observation import validate_nesting_checkpoint_observation_space
+from evaluate_batch import load_nesting_model, run_rl_episode
+from integration.evaluation_checkpoint import resolve_latest_phase3_pair
+from integration.evaluation_results import (
+    build_manifest, case_record, create_run_directory, formal_metrics,
+    make_evaluation_case, make_run_id, write_evaluation_results,
+)
+from models.sched_policy_loader import load_scheduling_policy
 
 # 配置字体
 plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial']
@@ -29,37 +32,9 @@ def get_colors(n):
 
 
 def find_latest_experiment_models(exp_root="./experiments"):
-    if not os.path.exists(exp_root):
-        print(f"Error: Experiment directory not found: {exp_root}")
-        return None, None, None
-
-    exp_dirs = glob.glob(os.path.join(exp_root, "exp_*"))
-    if not exp_dirs:
-        print("Error: No experiment records found")
-        return None, None, None
-
-    latest_exp = max(exp_dirs, key=os.path.getctime)
-    print(f"Locked Experiment: {latest_exp}")
-
-    model_dir = os.path.join(latest_exp, "models")
-    cycles = []
-    if os.path.exists(model_dir):
-        for f in os.listdir(model_dir):
-            if "nesting_c" in f:
-                try:
-                    cycles.append(int(f.split("_c")[1].split(".zip")[0]))
-                except:
-                    pass
-
-    if not cycles:
-        print("Error: No models found in this experiment")
-        return None, None, None
-
-    latest_c = max(cycles)
-    print(f"Loading Cycle: {latest_c}")
-    nest_path = os.path.join(model_dir, f"nesting_c{latest_c}")
-    sched_path = os.path.join(model_dir, f"scheduling_c{latest_c}")
-    return nest_path, sched_path, latest_exp
+    pair = resolve_latest_phase3_pair(exp_root)
+    return (str(pair.nesting_checkpoint), str(pair.scheduling_checkpoint),
+            str(pair.experiment_dir))
 
 
 def plot_nesting(plates, order_colors, save_dir=".", file_prefix="result"):
@@ -217,19 +192,19 @@ def plot_jit_analysis(orders, metrics, save_dir=".", file_prefix="result"):
 
 
 def main():
-    nest_path, sched_path, exp_dir = find_latest_experiment_models()
-    if not nest_path: return
+    pair = resolve_latest_phase3_pair()
+    nest_path = str(pair.nesting_checkpoint)
+    sched_path = str(pair.scheduling_checkpoint)
 
     # Initialize the base environment; bind the policy evaluator after loading.
     nest_base = NestingSchedulingEnv()
 
     print("Loading Models...")
-    nest_model = MaskablePPO.load(nest_path)
-    validate_nesting_checkpoint_observation_space(nest_model)
-    sched_model = MaskablePPO.load(sched_path)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    nest_model = load_nesting_model(nest_path, nest_base.layout, device)
+    sched_model = load_scheduling_policy(sched_path, device=device)
     nest_terminal_env = make_dual_agent_terminal_wrapper(
         nest_base, sched_model)
-    nest_env = ActionMasker(nest_terminal_env, mask_fn)
 
     print("Generating Visualization...")
 
@@ -238,35 +213,40 @@ def main():
     TEST_W = 200
     TEST_H = 200
     file_prefix = f"N{TEST_N}_Size{TEST_W}x{TEST_H}"
+    base_seed = 42
+    case = make_evaluation_case(
+        0, base_seed, num_parts=TEST_N, plate_size=(TEST_W, TEST_H),
+        scenario="visualization", config={"evaluation": "test_result"})
+    run_id = make_run_id("test_result", pair, base_seed)
+    run_dir = create_run_directory("./evaluation_results", run_id)
 
-    obs, _ = nest_env.reset(seed=42, options={
-        "num_parts": TEST_N,
-        "plate_size": (TEST_W, TEST_H)
-    })
+    run_rl_episode(
+        nest_terminal_env, nest_model, device=device, seed=case.case_seed,
+        options={"instance": case.independent_instance()})
 
-    done = False
-    final_metrics = {}
-    while not done:
-        mask = get_action_masks(nest_env)
-        action, _ = nest_model.predict(obs, action_masks=mask, deterministic=True)
-        obs, _, terminated, _, info = nest_env.step(action)
-        done = terminated
-
-        if done:
-            final_metrics = info.get('episode_metrics', {})
-            final_metrics.update(nest_env.unwrapped.cost_metrics)
-
-    raw_env = nest_env.unwrapped
+    raw_env = nest_base
+    final_metrics = raw_env.cost_metrics
     plates = raw_env.history_plates
     logs = raw_env.scheduler_state_machine.log
     orders = raw_env.orders
     colors = get_colors(len(orders) + 5)
 
-    print(f"Results saved to: {exp_dir}")
+    metrics = formal_metrics(
+        plates, orders, raw_env.parts_pool, raw_env.plate_w, raw_env.plate_h)
+    record = case_record(
+        run_id, case, "Dual-Agent RL", evaluation_mode="policy",
+        pair=pair, metrics=metrics)
+    manifest = build_manifest(
+        run_id, "test_result", "policy", base_seed, 1, pair,
+        {"num_parts": TEST_N, "plate_size": [TEST_W, TEST_H],
+         "num_machines": case.instance.num_machines})
+    write_evaluation_results(run_dir, manifest, [record])
 
-    plot_nesting(plates, colors, save_dir=exp_dir, file_prefix=file_prefix)
-    plot_gantt(logs, orders, colors, save_dir=exp_dir, file_prefix=file_prefix)
-    plot_jit_analysis(orders, final_metrics, save_dir=exp_dir, file_prefix=file_prefix)
+    print(f"Results saved to: {run_dir}")
+
+    plot_nesting(plates, colors, save_dir=str(run_dir), file_prefix=file_prefix)
+    plot_gantt(logs, orders, colors, save_dir=str(run_dir), file_prefix=file_prefix)
+    plot_jit_analysis(orders, final_metrics, save_dir=str(run_dir), file_prefix=file_prefix)
 
 
 if __name__ == "__main__":
